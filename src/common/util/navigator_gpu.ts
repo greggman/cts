@@ -1,6 +1,7 @@
 /// <reference types="@webgpu/types" />
 
 import { TestCaseRecorder } from '../framework/fixture.js';
+import { patchWebGPU } from '../patch_webgpu.js';
 
 import { ErrorWithExtra, assert, objectEquals } from './util.js';
 
@@ -61,6 +62,8 @@ export function getGPU(recorder: TestCaseRecorder | null): GPU {
   }
 
   impl = gpuProvider();
+
+  patchWebGPU(impl);
 
   if (defaultRequestAdapterOptions) {
     // eslint-disable-next-line @typescript-eslint/unbound-method

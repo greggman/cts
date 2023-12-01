@@ -1,7 +1,7 @@
 {
   "extends": "./node_modules/gts/tsconfig-google.json",
   "compilerOptions": {
-    "lib": ["dom", "es2020"],
+    "lib": ["dom", "es2023"],
     "module": "esnext",
     /* Output options */
     "noEmit": true,
@@ -30,7 +30,7 @@
     "esModuleInterop": false,
     "isolatedModules": true,
     "skipLibCheck": true,
-    "target": "es2020"
+    "target": "es2022"
     // @tsconfig/strictest is a useful reference for new options:
     // https://github.com/tsconfig/bases/blob/main/bases/strictest.json
   },

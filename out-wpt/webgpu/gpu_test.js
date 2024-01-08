@@ -27,14 +27,16 @@ import {
   kQueryTypeInfo } from
 
 './capability_info.js';
+
 import {
   kTextureFormatInfo,
   kEncodableTextureFormats,
   resolvePerAspectFormat,
 
 
-  isCompressedTextureFormat } from
+  isCompressedTextureFormat,
 
+  isTextureFormatUsableAsStorageFormat } from
 './format_info.js';
 import { makeBufferWithContents } from './util/buffer.js';
 import { checkElementsEqual, checkElementsBetween } from './util/check_contents.js';
@@ -249,6 +251,36 @@ export class GPUTestSubcaseBatchState extends SubcaseBatchState {
           this.skip(`texture view dimension '${dimension}' is not supported`);
         }
       }
+    }
+  }
+
+  skipIfTextureFormatNotUsableAsStorageTexture(...formats) {
+    for (const format of formats) {
+      if (format && !isTextureFormatUsableAsStorageFormat(format, this.isCompatibility)) {
+        this.skip(`Texture with ${format} is not usable as a storage texture`);
+      }
+    }
+  }
+
+  /**
+   * Skips test if the given interpolation type or sampling is not supported.
+   */
+  skipIfInterpolationTypeOrSamplingNotSupported({
+    type,
+    sampling
+
+
+
+  }) {
+    if (this.isCompatibility) {
+      this.skipIf(
+        type === 'linear',
+        'interpolation type linear is not supported in compatibility mode'
+      );
+      this.skipIf(
+        sampling === 'sample',
+        'interpolation type linear is not supported in compatibility mode'
+      );
     }
   }
 }

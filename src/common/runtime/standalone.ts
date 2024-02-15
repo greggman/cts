@@ -12,6 +12,7 @@ import { TestQueryLevel } from '../internal/query/query.js';
 import { TestTreeNode, TestSubtree, TestTreeLeaf, TestTree } from '../internal/tree.js';
 import { setDefaultRequestAdapterOptions } from '../util/navigator_gpu.js';
 import { ErrorWithExtra, unreachable } from '../util/util.js';
+import './interpolate-flat-first-emulation.js';
 
 import {
   kCTSOptionsInfo,

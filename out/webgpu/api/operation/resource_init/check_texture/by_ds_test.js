@@ -4,6 +4,7 @@
 import { virtualMipSize } from '../../../../util/texture/base.js';
 
 
+
 function makeFullscreenVertexModule(device) {
   return device.createShaderModule({
     code: `
@@ -152,10 +153,10 @@ subresourceRange) =>
 
       depthStencilAttachment: {
         view: texture.createView(viewDescriptor),
-        depthStoreOp: formatInfo.depth ? 'store' : undefined,
         depthLoadOp: formatInfo.depth ? 'load' : undefined,
-        stencilStoreOp: formatInfo.stencil ? 'store' : undefined,
-        stencilLoadOp: formatInfo.stencil ? 'load' : undefined
+        depthStoreOp: formatInfo.depth ? 'store' : undefined,
+        stencilLoadOp: formatInfo.stencil ? 'load' : undefined,
+        stencilStoreOp: formatInfo.stencil ? 'store' : undefined
       }
     });
 

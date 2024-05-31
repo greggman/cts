@@ -27,6 +27,7 @@ Options:
   --compat                  Run tests in compatibility mode.
   --coverage                Add coverage data to each result.
   --verbose                 Print result/log of every test as it runs.
+  --debug                   Include debug messages in logging.
   --gpu-provider            Path to node module that provides the GPU implementation.
   --gpu-provider-flag       Flag to set on the gpu-provider as <flag>=<value>
   --unroll-const-eval-loops Unrolls loops in constant-evaluation shader execution tests
@@ -42,6 +43,8 @@ To shutdown the server perform an HTTP GET or POST at the URL:
 `);
   return sys.exit(rc);
 }
+
+
 
 
 
@@ -91,11 +94,17 @@ for (let i = 0; i < sys.args.length; ++i) {
       globalTestConfig.compatibility = true;
     } else if (a === '--coverage') {
       emitCoverage = true;
+    } else if (a === '--force-fallback-adapter') {
+      globalTestConfig.forceFallbackAdapter = true;
+    } else if (a === '--log-to-websocket') {
+      globalTestConfig.logToWebSocket = true;
     } else if (a === '--gpu-provider') {
       const modulePath = sys.args[++i];
       gpuProviderModule = require(modulePath);
     } else if (a === '--gpu-provider-flag') {
       gpuProviderFlags.push(sys.args[++i]);
+    } else if (a === '--debug') {
+      globalTestConfig.enableDebugLogs = true;
     } else if (a === '--unroll-const-eval-loops') {
       globalTestConfig.unrollConstEvalLoops = true;
     } else if (a === '--help') {
@@ -110,9 +119,12 @@ for (let i = 0; i < sys.args.length; ++i) {
 
 let codeCoverage = undefined;
 
-if (globalTestConfig.compatibility) {
+if (globalTestConfig.compatibility || globalTestConfig.forceFallbackAdapter) {
   // MAINTENANCE_TODO: remove the cast once compatibilityMode is officially added
-  setDefaultRequestAdapterOptions({ compatibilityMode: true });
+  setDefaultRequestAdapterOptions({
+    compatibilityMode: globalTestConfig.compatibility,
+    forceFallbackAdapter: globalTestConfig.forceFallbackAdapter
+  });
 }
 
 if (gpuProviderModule) {
@@ -150,7 +162,6 @@ if (verbose) {
 
 
 (async () => {
-  Logger.globalDebugMode = verbose;
   const log = new Logger();
   const testcases = new Map();
 
@@ -197,14 +208,16 @@ if (verbose) {
             if (codeCoverage !== undefined) {
               codeCoverage.begin();
             }
+            const start = performance.now();
             const result = await runTestcase(testcase);
+            const durationMS = performance.now() - start;
             const coverageData = codeCoverage !== undefined ? codeCoverage.end() : undefined;
             let message = '';
             if (result.logs !== undefined) {
               message = result.logs.map((log) => prettyPrintLog(log)).join('\n');
             }
             const status = result.status;
-            const res = { status, message, coverageData };
+            const res = { status, message, durationMS, coverageData };
             response.statusCode = 200;
             response.end(JSON.stringify(res));
           } else {

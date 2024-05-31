@@ -23,6 +23,7 @@ gen_wpt_cts_html.ts. Example:
   {
     "suite": "webgpu",
     "out": "path/to/output/cts.https.html",
+    "outJSON": "path/to/output/webgpu_variant_list.json",
     "template": "path/to/template/cts.https.html",
     "maxChunkTimeMS": 2000
   }
@@ -35,18 +36,33 @@ where arguments.txt is a file containing a list of arguments prefixes to both ge
 in the expectations. The entire variant list generation runs *once per prefix*, so this
 multiplies the size of the variant list.
 
-  ?worker=0&q=
-  ?worker=1&q=
+  ?debug=0&q=
+  ?debug=1&q=
 
 and myexpectations.txt is a file containing a list of WPT paths to suppress, e.g.:
 
-  path/to/cts.https.html?worker=0&q=webgpu:a/foo:bar={"x":1}
-  path/to/cts.https.html?worker=1&q=webgpu:a/foo:bar={"x":1}
+  path/to/cts.https.html?debug=0&q=webgpu:a/foo:bar={"x":1}
+  path/to/cts.https.html?debug=1&q=webgpu:a/foo:bar={"x":1}
 
-  path/to/cts.https.html?worker=1&q=webgpu:a/foo:bar={"x":3}
+  path/to/cts.https.html?debug=1&q=webgpu:a/foo:bar={"x":3}
 `);
   process.exit(rc);
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -100,12 +116,22 @@ let config;
           out: path.resolve(jsonFileDir, configJSON.out),
           template: path.resolve(jsonFileDir, configJSON.template),
           maxChunkTimeMS: configJSON.maxChunkTimeMS ?? Infinity,
-          argumentsPrefixes: configJSON.argumentsPrefixes ?? ['?q=']
+          argumentsPrefixes: configJSON.argumentsPrefixes ?? ['?q='],
+          noLongPathAssert: configJSON.noLongPathAssert ?? false
         };
+        if (configJSON.outVariantList) {
+          config.outVariantList = path.resolve(jsonFileDir, configJSON.outVariantList);
+        }
         if (configJSON.expectations) {
           config.expectations = {
             file: path.resolve(jsonFileDir, configJSON.expectations.file),
             prefix: configJSON.expectations.prefix
+          };
+        }
+        if (configJSON.fullyExpandSubtrees) {
+          config.fullyExpandSubtrees = {
+            file: path.resolve(jsonFileDir, configJSON.fullyExpandSubtrees.file),
+            prefix: configJSON.fullyExpandSubtrees.prefix
           };
         }
         break;
@@ -129,7 +155,8 @@ let config;
           template: templateFile,
           suite,
           maxChunkTimeMS: Infinity,
-          argumentsPrefixes: ['?q=']
+          argumentsPrefixes: ['?q='],
+          noLongPathAssert: false
         };
         if (process.argv.length >= 7) {
           config.argumentsPrefixes = (await fs.readFile(argsPrefixesFile, 'utf8')).
@@ -153,29 +180,16 @@ let config;
   config.argumentsPrefixes.sort((a, b) => b.length - a.length);
 
   // Load expectations (if any)
-  let expectationLines = new Set();
-  if (config.expectations) {
-    expectationLines = new Set(
-      (await fs.readFile(config.expectations.file, 'utf8')).split(/\r?\n/).filter((l) => l.length)
-    );
-  }
+  const expectations = await loadQueryFile(
+    config.argumentsPrefixes,
+    config.expectations
+  );
 
-  const expectations = new Map();
-  for (const prefix of config.argumentsPrefixes) {
-    expectations.set(prefix, []);
-  }
-
-  expLoop: for (const exp of expectationLines) {
-    // Take each expectation for the longest prefix it matches.
-    for (const argsPrefix of config.argumentsPrefixes) {
-      const prefix = config.expectations.prefix + argsPrefix;
-      if (exp.startsWith(prefix)) {
-        expectations.get(argsPrefix).push(exp.substring(prefix.length));
-        continue expLoop;
-      }
-    }
-    console.log('note: ignored expectation: ' + exp);
-  }
+  // Load fullyExpandSubtrees queries (if any)
+  const fullyExpand = await loadQueryFile(
+    config.argumentsPrefixes,
+    config.fullyExpandSubtrees
+  );
 
   const loader = new DefaultTestFileLoader();
   const lines = [];
@@ -183,6 +197,7 @@ let config;
     const rootQuery = new TestQueryMultiFile(config.suite, []);
     const tree = await loader.loadTree(rootQuery, {
       subqueriesToExpand: expectations.get(prefix),
+      fullyExpandSubtrees: fullyExpand.get(prefix),
       maxChunkTime: config.maxChunkTimeMS
     });
 
@@ -199,22 +214,24 @@ let config;
       alwaysExpandThroughLevel
     })) {
       assert(query instanceof TestQueryMultiCase);
-      const queryString = query.toString();
-      // Check for a safe-ish path length limit. Filename must be <= 255, and on Windows the whole
-      // path must be <= 259. Leave room for e.g.:
-      // 'c:\b\s\w\xxxxxxxx\layout-test-results\external\wpt\webgpu\cts_worker=0_q=...-actual.txt'
-      assert(
-        queryString.length < 185,
-        `Generated test variant would produce too-long -actual.txt filename. Possible solutions:
+      if (!config.noLongPathAssert) {
+        const queryString = query.toString();
+        // Check for a safe-ish path length limit. Filename must be <= 255, and on Windows the whole
+        // path must be <= 259. Leave room for e.g.:
+        // 'c:\b\s\w\xxxxxxxx\layout-test-results\external\wpt\webgpu\cts_worker=0_q=...-actual.txt'
+        assert(
+          queryString.length < 185,
+          `Generated test variant would produce too-long -actual.txt filename. Possible solutions:
 - Reduce the length of the parts of the test query
 - Reduce the parameterization of the test
 - Make the test function faster and regenerate the listing_meta entry
 - Reduce the specificity of test expectations (if you're using them)
 ${queryString}`
-      );
+        );
+      }
 
       lines.push({
-        urlQueryString: prefix + query.toString(), // "?worker=0&q=..."
+        urlQueryString: prefix + query.toString(), // "?debug=0&q=..."
         comment: useChunking ? `estimated: ${subtreeCounts?.totalTimeMS.toFixed(3)} ms` : undefined
       });
 
@@ -232,6 +249,39 @@ ${queryString}`
   process.exit(1);
 });
 
+async function loadQueryFile(
+argumentsPrefixes,
+queryFile)
+
+
+
+{
+  let lines = new Set();
+  if (queryFile) {
+    lines = new Set(
+      (await fs.readFile(queryFile.file, 'utf8')).split(/\r?\n/).filter((l) => l.length)
+    );
+  }
+
+  const result = new Map();
+  for (const prefix of argumentsPrefixes) {
+    result.set(prefix, []);
+  }
+
+  expLoop: for (const exp of lines) {
+    // Take each expectation for the longest prefix it matches.
+    for (const argsPrefix of argumentsPrefixes) {
+      const prefix = queryFile.prefix + argsPrefix;
+      if (exp.startsWith(prefix)) {
+        result.get(argsPrefix).push(exp.substring(prefix.length));
+        continue expLoop;
+      }
+    }
+    console.log('note: ignored expectation: ' + exp);
+  }
+  return result;
+}
+
 async function generateFile(
 lines)
 {
@@ -240,14 +290,21 @@ lines)
 
   result += await fs.readFile(config.template, 'utf8');
 
+  const variantList = [];
   for (const line of lines) {
     if (line !== undefined) {
-      if (line.urlQueryString) result += `<meta name=variant content='${line.urlQueryString}'>`;
+      if (line.urlQueryString) {
+        result += `<meta name=variant content='${line.urlQueryString}'>`;
+        variantList.push(line.urlQueryString);
+      }
       if (line.comment) result += `<!-- ${line.comment} -->`;
     }
     result += '\n';
   }
 
   await fs.writeFile(config.out, result);
+  if (config.outVariantList) {
+    await fs.writeFile(config.outVariantList, JSON.stringify(variantList, undefined, 2));
+  }
 }
 //# sourceMappingURL=gen_wpt_cts_html.js.map

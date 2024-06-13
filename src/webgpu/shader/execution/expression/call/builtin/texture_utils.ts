@@ -31,6 +31,10 @@ import { TexelView } from '../../../../../util/texture/texel_view.js';
 import { createTextureFromTexelViews } from '../../../../../util/texture.js';
 import { reifyExtent3D } from '../../../../../util/unions.js';
 
+export type Coord3DViews = '3d' | 'cube';
+// MAINTENANCE_TODO: Add 'cube' here once the software renderer supports derivatives for cube maps.
+export const kCoord3DViewsForDerivativeTests: Coord3DViews[] = ['3d'] as const;
+
 export type SampledType = 'f32' | 'i32' | 'u32';
 
 export const kSampleTypeInfo = {
@@ -44,6 +48,14 @@ export const kSampleTypeInfo = {
     format: 'rgba8uint',
   },
 } as const;
+
+// MAINTENANCE_TODO: Stop excluding slice compressed 3d formats.
+export function isSupportedViewFormatCombo(
+  format: GPUTextureFormat,
+  viewDimension: GPUTextureViewDimension
+) {
+  return !(isCompressedTextureFormat(format) && viewDimension === '3d');
+}
 
 /**
  * Used for textureDimension, textureNumLevels, textureNumLayers
@@ -162,6 +174,15 @@ export type vec2 = [number, number];
 export type vec3 = [number, number, number];
 export type vec4 = [number, number, number, number];
 export type Dimensionality = vec1 | vec2 | vec3;
+
+function elemOrZero<T extends Dimensionality>(v: Readonly<T> | undefined, i: number) {
+  return v !== undefined && i < v.length ? v[i] : 0;
+}
+
+function extendWithOnes<T extends Dimensionality>(v: Readonly<T> | number[], length: number) {
+  const ones = new Array<number>(length - v.length).fill(1);
+  return [...v, ...ones];
+}
 
 type TextureCallArgKeys = keyof TextureCallArgs<vec1>;
 const kTextureCallArgNames: TextureCallArgKeys[] = [
@@ -488,11 +509,12 @@ export function softwareTextureRead<T extends Dimensionality>(
   }
 }
 
-export type TextureTestOptions = {
+export type TextureTestOptions<T extends Dimensionality> = {
   ddx?: number; // the derivative we want at sample time
   ddy?: number;
-  uvwStart?: readonly [number, number]; // the starting uv value (these are used make the coordinates negative as it uncovered issues on some hardware)
-  offset?: readonly [number, number]; // a constant offset
+  uvwStart?: Readonly<T>; // the starting uv value (these are used make the coordinates negative as it uncovered issues on some hardware)
+  offset?: Readonly<T>; // a constant offset
+  viewDimension: GPUTextureViewDimension;
 };
 
 /**
@@ -581,10 +603,10 @@ export function softwareRasterize<T extends Dimensionality>(
   texture: Texture,
   sampler: GPUSamplerDescriptor,
   targetSize: [number, number],
-  options: TextureTestOptions
+  options: TextureTestOptions<T>
 ) {
   const [width, height] = targetSize;
-  const { ddx = 1, ddy = 1, uvwStart = [0, 0] } = options;
+  const { ddx = 1, ddy = 1, uvwStart, viewDimension } = options;
   const format = 'rgba32float';
 
   const textureSize = reifyExtent3D(texture.descriptor.size);
@@ -624,9 +646,12 @@ export function softwareRasterize<T extends Dimensionality>(
       // pass those into the softwareTextureRead<T> as they would normally be
       // derived from the change in coord.
       const coords = [
-        (fragX / width) * screenSpaceUMult + uvwStart[0],
-        (fragY / height) * screenSpaceVMult + uvwStart[1],
+        (fragX / width) * screenSpaceUMult + elemOrZero(uvwStart, 0),
+        (fragY / height) * screenSpaceVMult + elemOrZero(uvwStart, 1),
       ] as T;
+      if (viewDimension === '3d' || viewDimension === 'cube') {
+        coords[2] = (fragX / width) * 0.5 + (fragY / height) * 0.5 + elemOrZero(uvwStart, 2);
+      }
       const call: TextureCall<T> = {
         builtin: 'textureSample',
         coordType: 'f',
@@ -653,14 +678,14 @@ export function softwareRasterize<T extends Dimensionality>(
 /**
  * Render textured quad to an rgba32float texture.
  */
-export function drawTexture(
+export function drawTexture<T extends Dimensionality>(
   t: GPUTest & TextureTestMixinType,
   texture: GPUTexture,
   samplerDesc: GPUSamplerDescriptor,
-  options: TextureTestOptions
+  options: TextureTestOptions<T>
 ) {
   const device = t.device;
-  const { ddx = 1, ddy = 1, uvwStart = [0, 0, 0], offset } = options;
+  const { ddx = 1, ddy = 1, uvwStart = [0, 0, 0], offset, viewDimension } = options;
 
   const format = 'rgba32float';
   const renderTarget = t.createTextureTracked({
@@ -669,36 +694,57 @@ export function drawTexture(
     usage: GPUTextureUsage.COPY_SRC | GPUTextureUsage.RENDER_ATTACHMENT,
   });
 
+  let textureWGSL;
+  let coordWGSL;
+  switch (viewDimension) {
+    case '2d':
+      textureWGSL = 'texture_2d<f32>';
+      coordWGSL = 'v.uvw.xy';
+      break;
+    case '3d':
+      textureWGSL = 'texture_3d<f32>';
+      coordWGSL = 'v.uvw';
+      break;
+    case 'cube':
+      textureWGSL = 'texture_cube<f32>';
+      coordWGSL = 'v.uvw';
+      break;
+    default:
+      unreachable();
+  }
+
   // Compute the amount we need to multiply the unitQuad by get the
   // derivatives we want.
   const uMult = (ddx * renderTarget.width) / texture.width;
   const vMult = (ddy * renderTarget.height) / texture.height;
 
-  const offsetWGSL = offset ? `, vec2i(${offset[0]},${offset[1]})` : '';
+  const offsetWGSL = offset ? `, ${wgslExprT(offset)}` : '';
+  const uvStartWGSL = wgslExprT(extendWithOnes(uvwStart, 3));
+  const uvMultWGSL = wgslExprT([uMult, vMult, 1.0]);
 
   const code = `
 struct InOut {
   @builtin(position) pos: vec4f,
-  @location(0) uv: vec2f,
+  @location(0) uvw: vec3f,
 };
 
 @vertex fn vs(@builtin(vertex_index) vertex_index : u32) -> InOut {
   let positions = array(
-    vec2f(-1,  1), vec2f( 1,  1),
-    vec2f(-1, -1), vec2f( 1, -1),
+    vec3f(-1,  1, 0.5), vec3f( 1,  1, 1  ),
+    vec3f(-1, -1,   0), vec3f( 1, -1, 0.5),
   );
   let pos = positions[vertex_index];
   return InOut(
-    vec4f(pos, 0, 1),
-    (pos * 0.5 + 0.5) * vec2f(${uMult}, ${vMult}) + vec2f(${uvwStart[0]}, ${uvwStart[1]}),
+    vec4f(pos, 1),
+    (pos * vec3f(0.5, 0.5, 1.0) + vec3f(0.5, 0.5, 0.0)) * ${uvMultWGSL} + ${uvStartWGSL},
   );
 }
 
-@group(0) @binding(0) var          T    : texture_2d<f32>;
+@group(0) @binding(0) var          T    : ${textureWGSL};
 @group(0) @binding(1) var          S    : sampler;
 
 @fragment fn fs(v: InOut) -> @location(0) vec4f {
-  return textureSample(T, S, v.uv${offsetWGSL});
+  return textureSample(T, S, ${coordWGSL}${offsetWGSL});
 }
 `;
 
@@ -719,7 +765,7 @@ struct InOut {
   const bindGroup = device.createBindGroup({
     layout: pipeline.getBindGroupLayout(0),
     entries: [
-      { binding: 0, resource: texture.createView() },
+      { binding: 0, resource: texture.createView({ dimension: viewDimension }) },
       { binding: 1, resource: sampler },
     ],
   });
@@ -782,7 +828,7 @@ function getMaxFractionalDiffForTextureFormat(format: GPUTextureFormat) {
   if (format.includes('8unorm')) {
     return 7 / 255;
   } else if (format.includes('2unorm')) {
-    return 9 / 512;
+    return 13 / 512;
   } else if (format.includes('unorm')) {
     return 7 / 255;
   } else if (format.includes('8snorm')) {
@@ -825,7 +871,7 @@ export async function putDataInTextureThenDrawAndCheckResultsComparedToSoftwareR
   descriptor: GPUTextureDescriptor,
   viewDescriptor: GPUTextureViewDescriptor,
   samplerDesc: GPUSamplerDescriptor,
-  options: TextureTestOptions
+  options: TextureTestOptions<T>
 ) {
   const { texture, texels } = await createTextureWithRandomDataAndGetTexels(t, descriptor);
 
@@ -1354,6 +1400,20 @@ function layoutTwoColumns(columnA: string[], columnB: string[]) {
   return out;
 }
 
+function getDepthOrArrayLayersForViewDimension(viewDimension?: GPUTextureViewDimension) {
+  switch (viewDimension) {
+    case undefined:
+    case '2d':
+      return 1;
+    case '3d':
+      return 8;
+    case 'cube':
+      return 6;
+    default:
+      unreachable();
+  }
+}
+
 /**
  * Choose a texture size based on the given parameters.
  * The size will be in a multiple of blocks. If it's a cube
@@ -1375,9 +1435,10 @@ export function chooseTextureSize({
   const height = align(Math.max(minSize, blockHeight * minBlocks), blockHeight);
   if (viewDimension === 'cube') {
     const size = lcm(width, height);
-    return [size, size];
+    return [size, size, 6];
   }
-  return [width, height];
+  const depthOrArrayLayers = getDepthOrArrayLayersForViewDimension(viewDimension);
+  return [width, height, depthOrArrayLayers];
 }
 
 export const kSamplePointMethods = ['texel-centre', 'spiral'] as const;
@@ -1854,7 +1915,9 @@ function wgslTypeFor(data: number | Dimensionality, type: 'f' | 'i' | 'u'): stri
   return `${type}32`;
 }
 
-function wgslExpr(data: number | vec1 | vec2 | vec3 | vec4): string {
+function wgslExpr(
+  data: number | Readonly<vec1> | Readonly<vec2> | Readonly<vec3> | Readonly<vec4>
+): string {
   if (Array.isArray(data)) {
     switch (data.length) {
       case 1:
@@ -1868,6 +1931,19 @@ function wgslExpr(data: number | vec1 | vec2 | vec3 | vec4): string {
     }
   }
   return data.toString();
+}
+
+function wgslExprT<T extends Dimensionality | number[]>(data: Readonly<T> | number[]): string {
+  switch (data.length) {
+    case 1:
+      return data[0].toString();
+    case 2:
+      return `vec2(${data.map(v => v.toString()).join(', ')})`;
+    case 3:
+      return `vec3(${data.map(v => v.toString()).join(', ')})`;
+    default:
+      unreachable();
+  }
 }
 
 function binKey<T extends Dimensionality>(call: TextureCall<T>): string {

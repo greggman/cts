@@ -30,23 +30,12 @@ import {
   kCubeSamplePointMethods,
   SamplePointMethods,
   chooseTextureSize,
+  kCoord3DViewsForDerivativeTests,
+  isSupportedViewFormatCombo,
 } from './texture_utils.js';
 import { generateCoordBoundaries, generateOffsets } from './utils.js';
 
 const kTestableColorFormats = [...kEncodableTextureFormats, ...kCompressedTextureFormats] as const;
-
-function getDepthOrArrayLayersForViewDimension(viewDimension: GPUTextureViewDimension) {
-  switch (viewDimension) {
-    case '2d':
-      return 1;
-    case '3d':
-      return 8;
-    case 'cube':
-      return 6;
-    default:
-      unreachable();
-  }
-}
 
 function getTextureTypeForTextureViewDimension(viewDimension: GPUTextureViewDimension) {
   switch (viewDimension) {
@@ -256,7 +245,7 @@ test mip level selection based on derivatives
       descriptor,
       viewDescriptor,
       sampler,
-      { ddx, ddy, uvwStart, offset }
+      { ddx, ddy, uvwStart, offset, viewDimension: '2d' }
     );
   });
 
@@ -294,7 +283,7 @@ Parameters:
         return canPotentialFilter && isFillable;
       })
       .combine('viewDimension', ['3d', 'cube'] as const)
-      .filter(t => !isCompressedTextureFormat(t.format) || t.viewDimension === 'cube')
+      .filter(t => isSupportedViewFormatCombo(t.format, t.viewDimension))
       .combine('sample_points', kCubeSamplePointMethods)
       .filter(t => t.sample_points !== 'cube-edges' || t.viewDimension !== '3d')
       .beginSubcases()
@@ -319,14 +308,12 @@ Parameters:
     const { format, viewDimension, sample_points, addressModeU, addressModeV, minFilter, offset } =
       t.params;
 
-    const [width, height] = chooseTextureSize({ minSize: 8, minBlocks: 2, format, viewDimension });
-    const depthOrArrayLayers = getDepthOrArrayLayersForViewDimension(viewDimension);
-
+    const size = chooseTextureSize({ minSize: 8, minBlocks: 2, format, viewDimension });
     const descriptor: GPUTextureDescriptor = {
       format,
       dimension: viewDimension === '3d' ? '3d' : '2d',
       ...(t.isCompatibility && { textureBindingViewDimension: viewDimension }),
-      size: { width, height, depthOrArrayLayers },
+      size,
       usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
     };
     const { texels, texture } = await createTextureWithRandomDataAndGetTexels(t, descriptor);
@@ -375,6 +362,99 @@ Parameters:
       results
     );
     t.expectOK(res);
+  });
+
+g.test('sampled_3d_coords,derivatives')
+  .specURL('https://www.w3.org/TR/WGSL/#texturesample')
+  .desc(
+    `
+fn textureSample(t: texture_3d<f32>, s: sampler, coords: vec3<f32>) -> vec4<f32>
+fn textureSample(t: texture_3d<f32>, s: sampler, coords: vec3<f32>, offset: vec3<i32>) -> vec4<f32>
+fn textureSample(t: texture_cube<f32>, s: sampler, coords: vec3<f32>) -> vec4<f32>
+
+test mip level selection based on derivatives
+
+* TODO: test 3d compressed textures formats. Just remove the filter below 'viewDimension'
+`
+  )
+  .params(u =>
+    u
+      .combine('format', kTestableColorFormats)
+      .filter(t => {
+        const type = kTextureFormatInfo[t.format].color?.type;
+        const canPotentialFilter = type === 'float' || type === 'unfilterable-float';
+        // We can't easily put random bytes into compressed textures if they are float formats
+        // since we want the range to be +/- 1000 and not +/- infinity or NaN.
+        const isFillable = !isCompressedTextureFormat(t.format) || !t.format.endsWith('float');
+        return canPotentialFilter && isFillable;
+      })
+      .combine('viewDimension', kCoord3DViewsForDerivativeTests)
+      .filter(t => isSupportedViewFormatCombo(t.format, t.viewDimension))
+      .combine('mipmapFilter', ['nearest', 'linear'] as const)
+      .beginSubcases()
+      // note: this is the derivative we want at sample time. It is not the value
+      // passed directly to the shader. This way if we change the texture size
+      // or render target size we can compute the correct values to achieve the
+      // same results.
+      .combineWithParams([
+        { ddx: 0.5, ddy: 0.5 }, // test mag filter
+        { ddx: 1, ddy: 1 }, // test level 0
+        { ddx: 2, ddy: 1 }, // test level 1 via ddx
+        { ddx: 1, ddy: 4 }, // test level 2 via ddy
+        { ddx: 1.5, ddy: 1.5 }, // test mix between 1 and 2
+        { ddx: 6, ddy: 6 }, // test mix between 2 and 3 (there is no 3 so we should get just 2)
+        { ddx: 1.5, ddy: 1.5, offset: [4, 7, -8] as const }, // test mix between 1 and 2 with offset
+        { ddx: 1.5, ddy: 1.5, offset: [3, -3, 2] as const }, // test mix between 1 and 2 with offset
+        { ddx: 1.5, ddy: 1.5, uvwStart: [-3.5, -4, -5] as const }, // test mix between 1 and 2 with negative coords
+      ])
+      .filter(t => !(t.viewDimension === 'cube' && t.offset !== undefined))
+  )
+  .beforeAllSubcases(t => {
+    const { format } = t.params;
+    t.skipIfTextureFormatNotSupported(format);
+    const info = kTextureFormatInfo[format];
+    if (info.color?.type === 'unfilterable-float') {
+      t.selectDeviceOrSkipTestCase('float32-filterable');
+    } else {
+      t.selectDeviceForTextureFormatOrSkipTestCase(t.params.format);
+    }
+  })
+  .fn(async t => {
+    const { format, mipmapFilter, ddx, ddy, uvwStart, offset, viewDimension } = t.params;
+
+    // We want at least 4 blocks or something wide enough for 3 mip levels.
+    const size = chooseTextureSize({
+      minSize: 8,
+      minBlocks: 4,
+      format,
+      viewDimension,
+    });
+
+    const descriptor: GPUTextureDescriptor = {
+      format,
+      dimension: viewDimension === '3d' ? '3d' : '2d',
+      ...(t.isCompatibility && { textureBindingViewDimension: viewDimension }),
+      mipLevelCount: 3,
+      size,
+      usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
+    };
+
+    const sampler: GPUSamplerDescriptor = {
+      addressModeU: 'repeat',
+      addressModeV: 'repeat',
+      addressModeW: 'repeat',
+      minFilter: 'linear',
+      magFilter: 'linear',
+      mipmapFilter,
+    };
+    const viewDescriptor = {};
+    await putDataInTextureThenDrawAndCheckResultsComparedToSoftwareRasterizer(
+      t,
+      descriptor,
+      viewDescriptor,
+      sampler,
+      { ddx, ddy, uvwStart, offset, viewDimension }
+    );
   });
 
 g.test('depth_2d_coords')

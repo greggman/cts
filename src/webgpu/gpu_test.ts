@@ -1208,11 +1208,47 @@ export class GPUTest extends GPUTestBase {
   private provider: DeviceProvider | undefined;
   private mismatchedProvider: DeviceProvider | undefined;
 
+  private unwrappedDevice: GPUDevice | undefined;
+  private wrappedDevice: GPUDevice | undefined;
+
   override async init() {
     await super.init();
 
     this.provider = await this.sharedState.acquireProvider();
     this.mismatchedProvider = await this.sharedState.acquireMismatchedProvider();
+  }
+
+  private getWrappedDevice(unwrappedDevice: GPUDevice): GPUDevice {
+    assert(this.unwrappedDevice === undefined || unwrappedDevice === this.unwrappedDevice);
+    if (!this.wrappedDevice) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const builtDevice: Record<string, any> = {};
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const u = unwrappedDevice as unknown as Record<string, any>;
+      for (const key in u) {
+        const v = u[key];
+        builtDevice[key] = typeof v === 'function' ? v.bind(u) : v;
+      }
+
+      const trackResourceWrapper = (name: string) => {
+        builtDevice[name] = (boundFn => {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          return (...args: any[]) => {
+            const resource = boundFn(...args);
+            this.trackForCleanup(resource);
+            return resource;
+          };
+        })(builtDevice[name]);
+      };
+
+      trackResourceWrapper('createBuffer');
+      trackResourceWrapper('createTexture');
+      trackResourceWrapper('createQuerySet');
+
+      const wrappedDevice = builtDevice as GPUDevice;
+      this.wrappedDevice = wrappedDevice;
+    }
+    return this.wrappedDevice;
   }
 
   /** GPUAdapter that the device was created from. */
@@ -1226,7 +1262,7 @@ export class GPUTest extends GPUTestBase {
    */
   override get device(): GPUDevice {
     assert(this.provider !== undefined, 'internal error: DeviceProvider missing');
-    return this.provider.device;
+    return this.getWrappedDevice(this.provider.device);
   }
 
   /**
@@ -1238,7 +1274,7 @@ export class GPUTest extends GPUTestBase {
       this.mismatchedProvider !== undefined,
       'selectMismatchedDeviceOrSkipTestCase was not called in beforeAllSubcases'
     );
-    return this.mismatchedProvider.device;
+    return this.getWrappedDevice(this.mismatchedProvider.device);
   }
 
   /**

@@ -5034,6 +5034,14 @@ export const listing = [
       "shader",
       "validation",
       "expression",
+      "early_evaluation"
+    ]
+  },
+  {
+    "file": [
+      "shader",
+      "validation",
+      "expression",
       "matrix",
       "add_sub"
     ]
@@ -5133,6 +5141,14 @@ export const listing = [
       "expression",
       "unary",
       "logical_negation"
+    ]
+  },
+  {
+    "file": [
+      "shader",
+      "validation",
+      "extension",
+      "dual_source_blending"
     ]
   },
   {

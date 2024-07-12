@@ -5,10 +5,21 @@ Interface matching between vertex and fragment shader validation for createRende
 `;import { makeTestGroup } from '../../../../common/framework/test_group.js';
 import { range } from '../../../../common/util/util.js';
 
+
 import { CreateRenderPipelineValidationTest } from './common.js';
 
 function getVarName(i) {
   return `v${i}`;
+}
+
+function skipIfDisallowedInterpolationParameter(t, ...wgsl) {
+  if (t.isCompatibility) {
+    for (const s of wgsl) {
+      if (s.includes('linear') || s.includes('sample')) {
+        t.skip(`unsupported interpolation parameter in compat: ${wgsl}`);
+      }
+    }
+  }
 }
 
 class InterStageMatchingValidationTest extends CreateRenderPipelineValidationTest {
@@ -146,8 +157,8 @@ fn((t) => {
   const { isAsync, output, input } = t.params;
 
   const descriptor = t.getDescriptorWithStates(
-    t.getVertexStateWithOutputs([`@location(0) @interpolate(flat) vout0: ${output}`]),
-    t.getFragmentStateWithInputs([`@location(0) @interpolate(flat) fin0: ${input}`])
+    t.getVertexStateWithOutputs([`@location(0) @interpolate(flat, either) vout0: ${output}`]),
+    t.getFragmentStateWithInputs([`@location(0) @interpolate(flat, either) fin0: ${input}`])
   );
 
   t.doCreateRenderPipelineTest(isAsync, output === input, descriptor);
@@ -167,8 +178,8 @@ u.combine('isAsync', [false, true]).combineWithParams([
 { output: '', input: '@interpolate(linear)' },
 { output: '@interpolate(perspective)', input: '@interpolate(perspective)' },
 { output: '@interpolate(linear)', input: '@interpolate(perspective)' },
-{ output: '@interpolate(flat)', input: '@interpolate(perspective)' },
-{ output: '@interpolate(linear)', input: '@interpolate(flat)' },
+{ output: '@interpolate(flat, either)', input: '@interpolate(perspective)' },
+{ output: '@interpolate(linear)', input: '@interpolate(flat, either)' },
 {
   output: '@interpolate(linear, center)',
   input: '@interpolate(linear, center)',
@@ -176,6 +187,9 @@ u.combine('isAsync', [false, true]).combineWithParams([
 }]
 )
 ).
+beforeAllSubcases((t) => {
+  skipIfDisallowedInterpolationParameter(t, t.params.output, t.params.input);
+}).
 fn((t) => {
   const { isAsync, output, input, _success, _compat_success } = t.params;
 
@@ -209,7 +223,7 @@ u.combine('isAsync', [false, true]).combineWithParams([
   _success: true,
   _compat_success: false
 },
-{ output: '@interpolate(flat)', input: '@interpolate(flat)' },
+{ output: '@interpolate(flat, either)', input: '@interpolate(flat, either)' },
 { output: '@interpolate(perspective)', input: '@interpolate(perspective, sample)' },
 { output: '@interpolate(perspective, center)', input: '@interpolate(perspective, sample)' },
 {
@@ -219,6 +233,9 @@ u.combine('isAsync', [false, true]).combineWithParams([
 { output: '@interpolate(perspective, centroid)', input: '@interpolate(perspective)' }]
 )
 ).
+beforeAllSubcases((t) => {
+  skipIfDisallowedInterpolationParameter(t, t.params.output, t.params.input);
+}).
 fn((t) => {
   const { isAsync, output, input, _success, _compat_success } = t.params;
 

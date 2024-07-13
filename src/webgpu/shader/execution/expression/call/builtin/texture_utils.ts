@@ -16,6 +16,7 @@ import {
   lcm,
   lerp,
   quantizeToF32,
+  subtractVectors,
 } from '../../../../../util/math.js';
 import {
   effectiveViewDimensionForDimension,
@@ -459,7 +460,7 @@ export function softwareTextureRead<T extends Dimensionality>(
   assert(call.ddy !== undefined);
   const rep = kTexelRepresentationInfo[texture.texels[0].format];
   const texSize = reifyExtent3D(texture.descriptor.size);
-  const textureSize = [texSize.width, texSize.height];
+  const textureSize = [texSize.width, texSize.height, texSize.depthOrArrayLayers];
 
   // ddx and ddy are the values that would be passed to textureSampleGrad
   // If we're emulating textureSample then they're the computed derivatives
@@ -595,6 +596,14 @@ export async function checkCallResults<T extends Dimensionality>(
   return errs.length > 0 ? new Error(errs.join('\n')) : undefined;
 }
 
+function dFdx<T extends Dimensionality>(coord: T, dx: number): T {
+  return coord.map(v => v / dx) as T;
+}
+
+function dFdy<T extends Dimensionality>(coord: T, dy: number): T {
+  return coord.map(v => v / dy) as T;
+}
+
 /**
  * "Renders a quad" to a TexelView with the given parameters,
  * sampling from the given Texture.
@@ -624,10 +633,32 @@ export function softwareRasterize<T extends Dimensionality>(
   const rep = kTexelRepresentationInfo[format];
 
   const expData = new Float32Array(width * height * 4);
-  for (let y = 0; y < height; ++y) {
-    const fragY = height - y - 1 + 0.5;
-    for (let x = 0; x < width; ++x) {
-      const fragX = x + 0.5;
+  for (let cy = 0; cy < height; cy += 2) {
+    for (let cx = 0; cx < width; cx += 2) {
+      const cellCoords: T[] = [];
+      // compute coords for a 2x2 area so we can compute derivatives
+      for (let fy = 0; fy < 2; ++fy) {
+        for (let fx = 0; fx < 2; ++fx) {
+          const x = cx + fx;
+          const y = cy + fy;
+          const fragY = height - y - 1 + 0.5;
+          const fragX = x + 0.5;
+          const coord = [(fragX / width) * screenSpaceUMult + elemOrZero(uvwStart, 0)] as T;
+          if (viewDimension !== '1d') {
+            coord[1] = (fragY / height) * screenSpaceVMult + elemOrZero(uvwStart, 1);
+          }
+          if (viewDimension === '3d' || viewDimension === 'cube') {
+            coord[2] = (fragX / width) * 0.5 + (fragY / height) * 0.5 + elemOrZero(uvwStart, 2);
+          }
+          cellCoords.push(coord);
+        }
+      }
+
+      // We're drawing a quad that's the same size as the target so dx and dy are just width
+      const dx = 1; // / width;
+      const dy = 1; // / height;
+      const ddx = dFdx(subtractVectors(cellCoords[1], cellCoords[0]) as T, dx);
+      const ddy = dFdy(subtractVectors(cellCoords[2], cellCoords[0]) as T, dy);
       // This code calculates the same value that will be passed to
       // `textureSample` in the fragment shader for a given frag coord (see the
       // WGSL code which uses the same formula, but using interpolation). That
@@ -645,25 +676,25 @@ export function softwareRasterize<T extends Dimensionality>(
       // ddx and ddy in this case are the derivative values we want to test. We
       // pass those into the softwareTextureRead<T> as they would normally be
       // derived from the change in coord.
-      const coords = [
-        (fragX / width) * screenSpaceUMult + elemOrZero(uvwStart, 0),
-        (fragY / height) * screenSpaceVMult + elemOrZero(uvwStart, 1),
-      ] as T;
-      if (viewDimension === '3d' || viewDimension === 'cube') {
-        coords[2] = (fragX / width) * 0.5 + (fragY / height) * 0.5 + elemOrZero(uvwStart, 2);
+      for (let fy = 0; fy < 2; ++fy) {
+        for (let fx = 0; fx < 2; ++fx) {
+          const x = cx + fx;
+          const y = cy + fy;
+          const coords = cellCoords[fy * 2 + fx];
+          const call: TextureCall<T> = {
+            builtin: 'textureSample',
+            coordType: 'f',
+            coords,
+            ddx,
+            ddy,
+            offset: options.offset as T,
+          };
+          const sample = softwareTextureRead<T>(call, texture, sampler);
+          const rgba = { R: 0, G: 0, B: 0, A: 1, ...sample };
+          const asRgba32Float = new Float32Array(rep.pack(rgba));
+          expData.set(asRgba32Float, (y * width + x) * 4);
+        }
       }
-      const call: TextureCall<T> = {
-        builtin: 'textureSample',
-        coordType: 'f',
-        coords,
-        ddx: [ddx / textureSize.width, 0] as T,
-        ddy: [0, ddy / textureSize.height] as T,
-        offset: options.offset as T,
-      };
-      const sample = softwareTextureRead<T>(call, texture, sampler);
-      const rgba = { R: 0, G: 0, B: 0, A: 1, ...sample };
-      const asRgba32Float = new Float32Array(rep.pack(rgba));
-      expData.set(asRgba32Float, (y * width + x) * 4);
     }
   }
 

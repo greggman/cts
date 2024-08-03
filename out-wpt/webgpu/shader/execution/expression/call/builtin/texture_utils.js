@@ -2,7 +2,9 @@
 * AUTO-GENERATED - DO NOT EDIT. Source: https://github.com/gpuweb/cts
 **/import { keysOf } from '../../../../../../common/util/data_tables.js';import { assert, range, unreachable } from '../../../../../../common/util/util.js';import {
 
+  isCompressedFloatTextureFormat,
   isCompressedTextureFormat,
+  isDepthOrStencilTextureFormat,
   kEncodableTextureFormats,
   kTextureFormatInfo } from
 '../../../../../format_info.js';
@@ -20,11 +22,16 @@ import {
 import {
   effectiveViewDimensionForDimension,
   physicalMipSizeFromTexture,
+  reifyTextureDescriptor,
+
   virtualMipSize } from
 '../../../../../util/texture/base.js';
 import {
-  kTexelRepresentationInfo } from
+  kTexelRepresentationInfo,
 
+
+
+  TexelComponent } from
 
 '../../../../../util/texture/texel_data.js';
 import { TexelView } from '../../../../../util/texture/texel_view.js';
@@ -38,10 +45,10 @@ export const kSampleTypeInfo = {
     format: 'rgba8unorm'
   },
   i32: {
-    format: 'rgba32sint'
+    format: 'rgba8sint'
   },
   u32: {
-    format: 'rgba32uint'
+    format: 'rgba8uint'
   }
 };
 
@@ -86,6 +93,27 @@ export class WGSLTextureQueryTest extends GPUTest {
   }
 }
 
+/**
+ * Generates an array of pseudo random values based on a hash.
+ * For `i32` generates an integer in the range [-1, num]
+ * For `u32` generates an integer in the range [0, num)
+ * for `f32` generates an number in the range [-1 to num)
+ */
+export function makeRepeatableValuesInRanges({
+  hashInputs,
+  rangeDefs
+
+
+
+}) {
+  const _hashInputs = hashInputs.map((v) => typeof v === 'string' ? sumOfCharCodesOfString(v) : v);
+  return rangeDefs.map(({ num, type }, i) => {
+    const range = num + type === 'u32' ? 1 : 2;
+    const number = hashU32(..._hashInputs, i) / 0x1_0000_0000 * range - (type === 'u32' ? 0 : 1);
+    return type === 'f32' ? number : Math.floor(number);
+  });
+}
+
 function getLimitValue(v) {
   switch (v) {
     case Number.POSITIVE_INFINITY:
@@ -99,13 +127,15 @@ function getLimitValue(v) {
 
 function getValueBetweenMinAndMaxTexelValueInclusive(
 rep,
+component,
 normalized)
 {
-  return lerp(
-    getLimitValue(rep.numericRange.min),
-    getLimitValue(rep.numericRange.max),
-    normalized
-  );
+  assert(!!rep.numericRange);
+  const perComponentRanges = rep.numericRange;
+  const perComponentRange = perComponentRanges[component];
+  const range = rep.numericRange;
+  const { min, max } = perComponentRange ? perComponentRange : range;
+  return lerp(getLimitValue(min), getLimitValue(max), normalized);
 }
 
 /**
@@ -118,20 +148,77 @@ export function getTexelViewFormatForTextureFormat(format) {
   return format.endsWith('-srgb') ? 'rgba8unorm-srgb' : 'rgba32float';
 }
 
+const kTextureTypeInfo = {
+  depth: {
+    componentType: 'f32',
+    resultType: 'vec4f',
+    resultFormat: 'rgba32float'
+  },
+  float: {
+    componentType: 'f32',
+    resultType: 'vec4f',
+    resultFormat: 'rgba32float'
+  },
+  'unfilterable-float': {
+    componentType: 'f32',
+    resultType: 'vec4f',
+    resultFormat: 'rgba32float'
+  },
+  sint: {
+    componentType: 'i32',
+    resultType: 'vec4i',
+    resultFormat: 'rgba32sint'
+  },
+  uint: {
+    componentType: 'u32',
+    resultType: 'vec4u',
+    resultFormat: 'rgba32uint'
+  }
+};
+
+function getTextureFormatTypeInfo(format) {
+  const info = kTextureFormatInfo[format];
+  const type = info.color?.type ?? info.depth?.type ?? info.stencil?.type;
+  assert(!!type);
+  return kTextureTypeInfo[type];
+}
+
+/**
+ * given a texture type 'base', returns the base with the correct component for the given texture format.
+ * eg: `getTextureType('texture_2d', someUnsignedIntTextureFormat)` -> `texture_2d<u32>`
+ */
+export function appendComponentTypeForFormatToTextureType(base, format) {
+  return base.includes('depth') ?
+  base :
+  `${base}<${getTextureFormatTypeInfo(format).componentType}>`;
+}
+
 /**
  * Creates a TexelView filled with random values.
  */
 export function createRandomTexelView(info)
 
 
+
 {
   const rep = kTexelRepresentationInfo[info.format];
+  const size = reifyExtent3D(info.size);
   const generator = (coords) => {
     const texel = {};
     for (const component of rep.componentOrder) {
-      const rnd = hashU32(coords.x, coords.y, coords.z, component.charCodeAt(0));
+      const rnd = hashU32(
+        coords.x,
+        coords.y,
+        coords.z,
+        coords.sampleIndex ?? 0,
+        component.charCodeAt(0),
+        info.mipLevel,
+        size.width,
+        size.height,
+        size.depthOrArrayLayers
+      );
       const normalized = clamp(rnd / 0xffffffff, { min: 0, max: 1 });
-      texel[component] = getValueBetweenMinAndMaxTexelValueInclusive(rep, normalized);
+      texel[component] = getValueBetweenMinAndMaxTexelValueInclusive(rep, component, normalized);
     }
     return quantize(texel, rep);
   };
@@ -152,7 +239,8 @@ export function createRandomTexelViewMipmap(info)
   return range(mipLevelCount, (i) =>
   createRandomTexelView({
     format: info.format,
-    size: virtualMipSize(dimension, info.size, i)
+    size: virtualMipSize(dimension, info.size, i),
+    mipLevel: i
   })
   );
 }
@@ -166,11 +254,16 @@ export function createRandomTexelViewMipmap(info)
 
 const kTextureCallArgNames = [
 'coords',
-'mipLevel',
 'arrayIndex',
+'sampleIndex',
+'mipLevel',
 'ddx',
 'ddy',
 'offset'];
+
+
+
+
 
 
 
@@ -245,6 +338,54 @@ const add = (a, b) => apply(a, b, (x, y) => x + y);
 
 
 /**
+ * Converts the src texel representation to an RGBA representation.
+ */
+function convertPerTexelComponentToResultFormat(
+src,
+format)
+{
+  const rep = kTexelRepresentationInfo[format];
+  const out = { R: 0, G: 0, B: 0, A: 1 };
+  for (const component of rep.componentOrder) {
+    switch (component) {
+      case 'Stencil':
+      case 'Depth':
+        out.R = src[component];
+        break;
+      default:
+        assert(out[component] !== undefined); // checks that component = R, G, B or A
+        out[component] = src[component];
+    }
+  }
+  return out;
+}
+
+/**
+ * Convert RGBA result format to texel view format of src texture.
+ * Effectively this converts something like { R: 0.1, G: 0, B: 0, A: 1 }
+ * to { Depth: 0.1 }
+ */
+function convertResultFormatToTexelViewFormat(
+src,
+format)
+{
+  const rep = kTexelRepresentationInfo[format];
+  const out = {};
+  for (const component of rep.componentOrder) {
+    out[component] = src[component] ?? src.R;
+  }
+  return out;
+}
+
+function zeroValuePerTexelComponent(components) {
+  const out = {};
+  for (const component of components) {
+    out[component] = 0;
+  }
+  return out;
+}
+
+/**
  * Returns the expect value for a WGSL builtin texture function for a single
  * mip level
  */
@@ -254,23 +395,25 @@ texture,
 sampler,
 mipLevel)
 {
-  const rep = kTexelRepresentationInfo[texture.texels[mipLevel].format];
+  const { format } = texture.texels[0];
+  const rep = kTexelRepresentationInfo[format];
   const textureSize = virtualMipSize(
     texture.descriptor.dimension || '2d',
     texture.descriptor.size,
     mipLevel
   );
   const addressMode = [
-  sampler.addressModeU ?? 'clamp-to-edge',
-  sampler.addressModeV ?? 'clamp-to-edge',
-  sampler.addressModeW ?? 'clamp-to-edge'];
+  sampler?.addressModeU ?? 'clamp-to-edge',
+  sampler?.addressModeV ?? 'clamp-to-edge',
+  sampler?.addressModeW ?? 'clamp-to-edge'];
 
 
   const load = (at) =>
   texture.texels[mipLevel].color({
     x: Math.floor(at[0]),
     y: Math.floor(at[1] ?? 0),
-    z: Math.floor(at[2] ?? 0)
+    z: call.arrayIndex ?? Math.floor(at[2] ?? 0),
+    sampleIndex: call.sampleIndex
   });
 
   const isCube = texture.viewDescriptor.dimension === 'cube';
@@ -304,7 +447,7 @@ mipLevel)
 
         const samples = [];
 
-        const filter = sampler.minFilter;
+        const filter = sampler?.minFilter ?? 'nearest';
         switch (filter) {
           case 'linear':{
               // 'p0' is the lower texel for 'at'
@@ -416,10 +559,13 @@ mipLevel)
           }
         }
 
-        return out;
+        return convertPerTexelComponentToResultFormat(out, format);
       }
     case 'textureLoad':{
-        return load(toArray(call.coords));
+        const out = isOutOfBoundsCall(texture, call) ?
+        zeroValuePerTexelComponent(rep.componentOrder) :
+        load(call.coords);
+        return convertPerTexelComponentToResultFormat(out, format);
       }
   }
 }
@@ -496,6 +642,157 @@ sampler)
 
 
 /**
+ * out of bounds is defined as any of the following being true
+ *
+ * * coords is outside the range [0, textureDimensions(t, level))
+ * * array_index is outside the range [0, textureNumLayers(t))
+ * * level is outside the range [0, textureNumLevels(t))
+ * * sample_index is outside the range [0, textureNumSamples(s))
+ */
+function isOutOfBoundsCall(texture, call) {
+  assert(call.coords !== undefined);
+  assert(call.offset === undefined);
+
+  const desc = reifyTextureDescriptor(texture.descriptor);
+
+  const { coords, mipLevel, arrayIndex, sampleIndex } = call;
+
+  if (mipLevel !== undefined && (mipLevel < 0 || mipLevel >= desc.mipLevelCount)) {
+    return true;
+  }
+
+  const size = virtualMipSize(
+    texture.descriptor.dimension || '2d',
+    texture.descriptor.size,
+    mipLevel ?? 0
+  );
+
+  for (let i = 0; i < coords.length; ++i) {
+    const v = coords[i];
+    if (v < 0 || v >= size[i]) {
+      return true;
+    }
+  }
+
+  if (arrayIndex !== undefined) {
+    const size = reifyExtent3D(desc.size);
+    if (arrayIndex < 0 || arrayIndex >= size.depthOrArrayLayers) {
+      return true;
+    }
+  }
+
+  if (sampleIndex !== undefined) {
+    if (sampleIndex < 0 || sampleIndex >= desc.sampleCount) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * For a texture builtin with no sampler (eg textureLoad),
+ * any out of bounds access is allowed to return one of:
+ *
+ * * the value of any texel in the texture
+ * * 0,0,0,0 or 0,0,0,1 if not a depth texture
+ * * 0 if a depth texture
+ */
+function okBecauseOutOfBounds(
+texture,
+call,
+gotRGBA,
+maxFractionalDiff)
+{
+  if (!isOutOfBoundsCall(texture, call)) {
+    return false;
+  }
+
+  if (texture.descriptor.format.includes('depth')) {
+    if (gotRGBA.R === 0) {
+      return true;
+    }
+  } else {
+    if (
+    gotRGBA.R === 0 &&
+    gotRGBA.B === 0 &&
+    gotRGBA.G === 0 && (
+    gotRGBA.A === 0 || gotRGBA.A === 1))
+    {
+      return true;
+    }
+  }
+
+  for (let mipLevel = 0; mipLevel < texture.texels.length; ++mipLevel) {
+    const mipTexels = texture.texels[mipLevel];
+    const size = virtualMipSize(
+      texture.descriptor.dimension || '2d',
+      texture.descriptor.size,
+      mipLevel
+    );
+    const sampleCount = texture.descriptor.sampleCount ?? 1;
+    for (let z = 0; z < size[2]; ++z) {
+      for (let y = 0; y < size[1]; ++y) {
+        for (let x = 0; x < size[0]; ++x) {
+          for (let sampleIndex = 0; sampleIndex < sampleCount; ++sampleIndex) {
+            const texel = mipTexels.color({ x, y, z, sampleIndex });
+            const rgba = convertPerTexelComponentToResultFormat(texel, mipTexels.format);
+            if (texelsApproximatelyEqual(gotRGBA, rgba, mipTexels.format, maxFractionalDiff)) {
+              return true;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return false;
+}
+
+const kRGBAComponents = [
+TexelComponent.R,
+TexelComponent.G,
+TexelComponent.B,
+TexelComponent.A];
+
+
+const kRComponent = [TexelComponent.R];
+
+function texelsApproximatelyEqual(
+gotRGBA,
+expectRGBA,
+format,
+maxFractionalDiff)
+{
+  const rep = kTexelRepresentationInfo[format];
+  const got = convertResultFormatToTexelViewFormat(gotRGBA, format);
+  const expect = convertResultFormatToTexelViewFormat(expectRGBA, format);
+  const gULP = convertPerTexelComponentToResultFormat(
+    rep.bitsToULPFromZero(rep.numberToBits(got)),
+    format
+  );
+  const eULP = convertPerTexelComponentToResultFormat(
+    rep.bitsToULPFromZero(rep.numberToBits(expect)),
+    format
+  );
+
+  const rgbaComponentsToCheck = isDepthOrStencilTextureFormat(format) ?
+  kRComponent :
+  kRGBAComponents;
+
+  for (const component of rgbaComponentsToCheck) {
+    const g = gotRGBA[component];
+    const e = expectRGBA[component];
+    const absDiff = Math.abs(g - e);
+    const ulpDiff = Math.abs(gULP[component] - eULP[component]);
+    if (ulpDiff > 3 && absDiff > maxFractionalDiff) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * Checks the result of each call matches the expected result.
  */
 export async function checkCallResults(
@@ -508,12 +805,30 @@ results)
 {
   const errs = [];
   const rep = kTexelRepresentationInfo[texture.texels[0].format];
-  const maxFractionalDiff = getMaxFractionalDiffForTextureFormat(texture.descriptor.format);
+  const maxFractionalDiff =
+  sampler?.minFilter === 'linear' ||
+  sampler?.magFilter === 'linear' ||
+  sampler?.mipmapFilter === 'linear' ?
+  getMaxFractionalDiffForTextureFormat(texture.descriptor.format) :
+  0;
+
   for (let callIdx = 0; callIdx < calls.length; callIdx++) {
     const call = calls[callIdx];
-    const got = results[callIdx];
-    const expect = softwareTextureReadMipLevel(call, texture, sampler, 0);
+    const gotRGBA = results[callIdx];
+    const expectRGBA = softwareTextureReadMipLevel(call, texture, sampler, call.mipLevel ?? 0);
 
+    if (
+    texelsApproximatelyEqual(gotRGBA, expectRGBA, texture.texels[0].format, maxFractionalDiff))
+    {
+      continue;
+    }
+
+    if (!sampler && okBecauseOutOfBounds(texture, call, gotRGBA, maxFractionalDiff)) {
+      continue;
+    }
+
+    const got = convertResultFormatToTexelViewFormat(gotRGBA, texture.texels[0].format);
+    const expect = convertResultFormatToTexelViewFormat(expectRGBA, texture.texels[0].format);
     const gULP = rep.bitsToULPFromZero(rep.numberToBits(got));
     const eULP = rep.bitsToULPFromZero(rep.numberToBits(expect));
     for (const component of rep.componentOrder) {
@@ -524,7 +839,10 @@ results)
       const relDiff = absDiff / Math.max(Math.abs(g), Math.abs(e));
       if (ulpDiff > 3 && absDiff > maxFractionalDiff) {
         const desc = describeTextureCall(call);
+        const size = reifyExtent3D(texture.descriptor.size);
         errs.push(`component was not as expected:
+      size: [${size.width}, ${size.height}, ${size.depthOrArrayLayers}]
+  mipCount: ${texture.descriptor.mipLevelCount ?? 1}
       call: ${desc}  // #${callIdx}
  component: ${component}
        got: ${g}
@@ -532,40 +850,42 @@ results)
   abs diff: ${absDiff.toFixed(4)}
   rel diff: ${(relDiff * 100).toFixed(2)}%
   ulp diff: ${ulpDiff}
-  sample points:
 `);
-        const expectedSamplePoints = [
-        'expected:',
-        ...(await identifySamplePoints(texture, (texels) => {
-          return Promise.resolve(
-            softwareTextureReadMipLevel(
-              call,
-              {
-                texels: [texels],
-                descriptor: texture.descriptor,
-                viewDescriptor: texture.viewDescriptor
-              },
-              sampler,
-              0
-            )
-          );
-        }))];
+        if (sampler) {
+          const expectedSamplePoints = [
+          'expected:',
+          ...(await identifySamplePoints(texture, (texels) => {
+            return Promise.resolve(
+              softwareTextureReadMipLevel(
+                call,
+                {
+                  texels: [texels],
+                  descriptor: texture.descriptor,
+                  viewDescriptor: texture.viewDescriptor
+                },
+                sampler,
+                0
+              )
+            );
+          }))];
 
-        const gotSamplePoints = [
-        'got:',
-        ...(await identifySamplePoints(texture, async (texels) => {
-          const gpuTexture = createTextureFromTexelViews(t, [texels], texture.descriptor);
-          const result = (
-          await doTextureCalls(t, gpuTexture, texture.viewDescriptor, textureType, sampler, [
-          call]
-          ))[
-          0];
-          gpuTexture.destroy();
-          return result;
-        }))];
+          const gotSamplePoints = [
+          'got:',
+          ...(await identifySamplePoints(texture, async (texels) => {
+            const gpuTexture = createTextureFromTexelViews(t, [texels], texture.descriptor);
+            const result = (
+            await doTextureCalls(t, gpuTexture, texture.viewDescriptor, textureType, sampler, [
+            call]
+            ))[
+            0];
+            gpuTexture.destroy();
+            return result;
+          }))];
 
-        errs.push(layoutTwoColumns(expectedSamplePoints, gotSamplePoints).join('\n'));
-        errs.push('', '');
+          errs.push('  sample points:');
+          errs.push(layoutTwoColumns(expectedSamplePoints, gotSamplePoints).join('\n'));
+          errs.push('', '');
+        }
       }
     }
   }
@@ -794,7 +1114,8 @@ function getMaxFractionalDiffForTextureFormat(format) {
   } else if (format.endsWith('float')) {
     return 44;
   } else {
-    unreachable();
+    // It's likely an integer format. In any case, zero tolerance is passable.
+    return 0;
   }
 }
 
@@ -911,6 +1232,7 @@ function getBlockFiller(format) {
  * Fills a texture with random data.
  */
 export function fillTextureWithRandomData(device, texture) {
+  assert(!isCompressedFloatTextureFormat(texture.format));
   const info = kTextureFormatInfo[texture.format];
   const hashBase =
   sumOfCharCodesOfString(texture.format) +
@@ -978,10 +1300,17 @@ format)
   if (!pipeline) {
     let textureWGSL;
     let loadWGSL;
+    let dimensionWGSL = 'textureDimensions(tex, uni.mipLevel)';
     switch (viewDimension) {
       case '2d':
-        textureWGSL = 'texture_2d<f32>';
-        loadWGSL = 'textureLoad(tex, global_invocation_id.xy, mipLevel)';
+        if (texture.sampleCount > 1) {
+          textureWGSL = 'texture_multisampled_2d<f32>';
+          loadWGSL = 'textureLoad(tex, coord.xy, sampleIndex)';
+          dimensionWGSL = 'textureDimensions(tex)';
+        } else {
+          textureWGSL = 'texture_2d<f32>';
+          loadWGSL = 'textureLoad(tex, coord.xy, mipLevel)';
+        }
         break;
       case 'cube-array': // cube-array doesn't exist in compat so we can just use 2d_array for this
       case '2d-array':
@@ -989,18 +1318,18 @@ format)
         loadWGSL = `
           textureLoad(
               tex,
-              global_invocation_id.xy,
-              global_invocation_id.z,
+              coord.xy,
+              coord.z,
               mipLevel)`;
         break;
       case '3d':
         textureWGSL = 'texture_3d<f32>';
-        loadWGSL = 'textureLoad(tex, global_invocation_id.xyz, mipLevel)';
+        loadWGSL = 'textureLoad(tex, coord.xyz, mipLevel)';
         break;
       case 'cube':
         textureWGSL = 'texture_cube<f32>';
         loadWGSL = `
-          textureLoadCubeAs2DArray(tex, global_invocation_id.xy, global_invocation_id.z, mipLevel);
+          textureLoadCubeAs2DArray(tex, coord.xy, coord.z, mipLevel);
         `;
         break;
       default:
@@ -1028,7 +1357,12 @@ format)
           return textureSampleLevel(tex, smp, cubeCoord, f32(mipLevel));
         }
 
-        @group(0) @binding(0) var<uniform> mipLevel: u32;
+        struct Uniforms {
+          mipLevel: u32,
+          sampleCount: u32,
+        };
+
+        @group(0) @binding(0) var<uniform> uni: Uniforms;
         @group(0) @binding(1) var tex: ${textureWGSL};
         @group(0) @binding(2) var smp: sampler;
         @group(0) @binding(3) var<storage, read_write> data: array<vec4f>;
@@ -1036,10 +1370,13 @@ format)
         @compute @workgroup_size(1) fn cs(
           @builtin(global_invocation_id) global_invocation_id : vec3<u32>) {
           _ = smp;
-          let size = textureDimensions(tex, mipLevel);
-          let ndx = global_invocation_id.z * size.x * size.y +
-                    global_invocation_id.y * size.x +
+          let size = ${dimensionWGSL};
+          let ndx = global_invocation_id.z * size.x * size.y * uni.sampleCount +
+                    global_invocation_id.y * size.x * uni.sampleCount +
                     global_invocation_id.x;
+          let coord = vec3u(global_invocation_id.x / uni.sampleCount, global_invocation_id.yz);
+          let sampleIndex = global_invocation_id.x % uni.sampleCount;
+          let mipLevel = uni.mipLevel;
           data[ndx] = ${loadWGSL};
         }
       `
@@ -1054,7 +1391,7 @@ format)
   for (let mipLevel = 0; mipLevel < texture.mipLevelCount; ++mipLevel) {
     const size = virtualMipSize(texture.dimension, texture, mipLevel);
 
-    const uniformValues = new Uint32Array([mipLevel, 0, 0, 0]); // min size is 16 bytes
+    const uniformValues = new Uint32Array([mipLevel, texture.sampleCount, 0, 0]); // min size is 16 bytes
     const uniformBuffer = t.createBufferTracked({
       size: uniformValues.byteLength,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
@@ -1062,7 +1399,7 @@ format)
     device.queue.writeBuffer(uniformBuffer, 0, uniformValues);
 
     const storageBuffer = t.createBufferTracked({
-      size: size[0] * size[1] * size[2] * 4 * 4, // rgba32float
+      size: size[0] * size[1] * size[2] * 4 * 4 * texture.sampleCount, // rgba32float
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC
     });
 
@@ -1087,7 +1424,7 @@ format)
     const pass = encoder.beginComputePass();
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, bindGroup);
-    pass.dispatchWorkgroups(...size);
+    pass.dispatchWorkgroups(size[0] * texture.sampleCount, size[1], size[2]);
     pass.end();
     encoder.copyBufferToBuffer(storageBuffer, 0, readBuffer, 0, readBuffer.size);
   }
@@ -1103,9 +1440,13 @@ format)
     const data = new Float32Array(readBuffer.getMappedRange()).slice();
     readBuffer.unmap();
 
+    const { sampleCount } = texture;
     texelViews.push(
       TexelView.fromTexelsAsColors(format, (coord) => {
-        const offset = (coord.z * size[0] * size[1] + coord.y * size[0] + coord.x) * 4;
+        const offset =
+        ((coord.z * size[0] * size[1] + coord.y * size[0] + coord.x) * sampleCount + (
+        coord.sampleIndex ?? 0)) *
+        4;
         return {
           R: data[offset + 0],
           G: data[offset + 1],
@@ -1354,6 +1695,20 @@ function layoutTwoColumns(columnA, columnB) {
   return out;
 }
 
+function getDepthOrArrayLayersForViewDimension(viewDimension) {
+  switch (viewDimension) {
+    case undefined:
+    case '2d':
+      return 1;
+    case '3d':
+      return 8;
+    case 'cube':
+      return 6;
+    default:
+      unreachable();
+  }
+}
+
 /**
  * Choose a texture size based on the given parameters.
  * The size will be in a multiple of blocks. If it's a cube
@@ -1375,9 +1730,10 @@ export function chooseTextureSize({
   const height = align(Math.max(minSize, blockHeight * minBlocks), blockHeight);
   if (viewDimension === 'cube') {
     const size = lcm(width, height);
-    return [size, size];
+    return [size, size, 6];
   }
-  return [width, height];
+  const depthOrArrayLayers = getDepthOrArrayLayersForViewDimension(viewDimension);
+  return [width, height, depthOrArrayLayers];
 }
 
 export const kSamplePointMethods = ['texel-centre', 'spiral'];
@@ -1387,12 +1743,30 @@ export const kCubeSamplePointMethods = ['cube-edges', 'texel-centre', 'spiral'];
 
 
 /**
+ * Used to specify a range from [0, num)
+ * The type is used to determine if values should be integers and if they can be negative.
+ */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/**
  * Generates an array of coordinates at which to sample a texture.
  */
-function generateSamplePointsImpl(
+function generateTextureBuiltinInputsImpl(
 makeValue,
 n,
-nearest,
 args)
 
 
@@ -1402,24 +1776,19 @@ args)
 
 
 
-
-
-
-
-
-
 {
-  const { method, textureWidth, textureHeight, textureDepthOrArrayLayers = 1 } = args;
-  const out = [];
+  const { method, descriptor } = args;
+  const dimension = descriptor.dimension ?? '2d';
+  const size = virtualMipSize(dimension, descriptor.size, 0);
+  const coords = [];
   switch (method) {
     case 'texel-centre':{
         for (let i = 0; i < n; i++) {
           const r = hashU32(i);
-          const x = Math.floor(lerp(0, textureWidth - 1, (r & 0xff) / 0xff)) + 0.5;
-          const y = Math.floor(lerp(0, textureHeight - 1, (r >> 8 & 0xff) / 0xff)) + 0.5;
-          const z =
-          Math.floor(lerp(0, textureDepthOrArrayLayers - 1, (r >> 16 & 0xff) / 0xff)) + 0.5;
-          out.push(makeValue(x / textureWidth, y / textureHeight, z / textureDepthOrArrayLayers));
+          const x = Math.floor(lerp(0, size[0] - 1, (r & 0xff) / 0xff)) + 0.5;
+          const y = Math.floor(lerp(0, size[1] - 1, (r >> 8 & 0xff) / 0xff)) + 0.5;
+          const z = Math.floor(lerp(0, size[2] - 1, (r >> 16 & 0xff) / 0xff)) + 0.5;
+          coords.push(makeValue(x / size[0], y / size[1], z / size[2]));
         }
         break;
       }
@@ -1429,11 +1798,25 @@ args)
           const f = i / (Math.max(n, 2) - 1);
           const r = radius * f;
           const a = loops * 2 * Math.PI * f;
-          out.push(makeValue(0.5 + r * Math.cos(a), 0.5 + r * Math.sin(a), 0));
+          coords.push(makeValue(0.5 + r * Math.cos(a), 0.5 + r * Math.sin(a), 0));
         }
         break;
       }
   }
+
+  const _hashInputs = args.hashInputs.map((v) =>
+  typeof v === 'string' ? sumOfCharCodesOfString(v) : typeof v === 'boolean' ? v ? 1 : 0 : v
+  );
+  const makeRangeValue = ({ num, type }, ...hashInputs) => {
+    const range = num + type === 'u32' ? 1 : 2;
+    const number =
+    hashU32(..._hashInputs, ...hashInputs) / 0x1_0000_0000 * range - (type === 'u32' ? 0 : 1);
+    return type === 'f32' ? number : Math.floor(number);
+  };
+  const makeIntHashValue = (min, max, ...hashInputs) => {
+    const range = max - min;
+    return min + Math.floor(hashU32(..._hashInputs, ...hashInputs) / 0x1_0000_0000 * range);
+  };
 
   // Samplers across devices use different methods to interpolate.
   // Quantizing the texture coordinates seems to hit coords that produce
@@ -1444,14 +1827,13 @@ args)
   // Linux, AMD Radeon Pro WX 3200: 256
   // MacOS, M1 Mac: 256
   const kSubdivisionsPerTexel = 4;
-  const q = [
-  textureWidth * kSubdivisionsPerTexel,
-  textureHeight * kSubdivisionsPerTexel,
-  textureDepthOrArrayLayers * kSubdivisionsPerTexel];
+  const nearest = !args.sampler || args.sampler.minFilter === 'nearest';
+  return coords.map((c, i) => {
+    const mipLevel = args.mipLevel ? makeRangeValue(args.mipLevel, i) : 0;
+    const mipSize = virtualMipSize(dimension, size, mipLevel);
+    const q = mipSize.map((v) => v * kSubdivisionsPerTexel);
 
-  return out.map(
-    (c) =>
-    c.map((v, i) => {
+    const coords = c.map((v, i) => {
       // Quantize to kSubdivisionsPerPixel
       const v1 = Math.floor(v * q[i]);
       // If it's nearest and we're on the edge of a texel then move us off the edge
@@ -1459,8 +1841,18 @@ args)
       const v2 = nearest && v1 % kSubdivisionsPerTexel === 0 ? v1 + 1 : v1;
       // Convert back to texture coords
       return v2 / q[i];
-    })
-  );
+    });
+
+    return {
+      coords,
+      mipLevel,
+      sampleIndex: args.sampleIndex ? makeRangeValue(args.sampleIndex, i, 1) : undefined,
+      arrayIndex: args.arrayIndex ? makeRangeValue(args.arrayIndex, i, 2) : undefined,
+      offset: args.offset ?
+      coords.map((_, j) => makeIntHashValue(-8, 8, i, 3 + j)) :
+      undefined
+    };
+  });
 }
 
 // Removes the first element from an array of types
@@ -1468,16 +1860,21 @@ args)
 
 
 
-export function generateSamplePoints1D(...args) {
-  return generateSamplePointsImpl((x) => [x], ...args);
+
+
+export function generateTextureBuiltinInputs1D(...args) {
+  return generateTextureBuiltinInputsImpl((x) => [x], ...args);
 }
 
-export function generateSamplePoints2D(...args) {
-  return generateSamplePointsImpl((x, y) => [x, y], ...args);
+export function generateTextureBuiltinInputs2D(...args) {
+  return generateTextureBuiltinInputsImpl((x, y) => [x, y], ...args);
 }
 
-export function generateSamplePoints3D(...args) {
-  return generateSamplePointsImpl((x, y, z) => [x, y, z], ...args);
+export function generateTextureBuiltinInputs3D(...args) {
+  return generateTextureBuiltinInputsImpl(
+    (x, y, z) => [x, y, z],
+    ...args
+  );
 }
 
 
@@ -1714,7 +2111,6 @@ coord)
  */
 export function generateSamplePointsCube(
 n,
-nearest,
 args)
 
 
@@ -1732,10 +2128,11 @@ args)
 
 
 
-
 {
-  const { method, textureWidth } = args;
-  const out = [];
+  const { method, descriptor } = args;
+  const size = virtualMipSize('2d', descriptor.size, 0);
+  const textureWidth = size[0];
+  const coords = [];
   switch (method) {
     case 'texel-centre':{
         for (let i = 0; i < n; i++) {
@@ -1744,7 +2141,7 @@ args)
           const v =
           (Math.floor(lerp(0, textureWidth - 1, (r >> 8 & 0xff) / 0xff)) + 0.5) / textureWidth;
           const face = Math.floor(lerp(0, 6, (r >> 16 & 0xff) / 0x100));
-          out.push(convertNormalized3DTexCoordToCubeCoord([u, v, face]));
+          coords.push(convertNormalized3DTexCoordToCubeCoord([u, v, face]));
         }
         break;
       }
@@ -1762,13 +2159,13 @@ args)
           const ux = cosTheta * sinPhi;
           const uy = cosPhi;
           const uz = sinTheta * sinPhi;
-          out.push([ux * r, uy * r, uz * r]);
+          coords.push([ux * r, uy * r, uz * r]);
         }
         break;
       }
     case 'cube-edges':{
 
-        out.push(
+        coords.push(
           // between edges
           [-1.01, -1.02, 0],
           [1.01, -1.02, 0],
@@ -1800,6 +2197,16 @@ args)
       }
   }
 
+  const _hashInputs = args.hashInputs.map((v) =>
+  typeof v === 'string' ? sumOfCharCodesOfString(v) : typeof v === 'boolean' ? v ? 1 : 0 : v
+  );
+  const makeRangeValue = ({ num, type }, ...hashInputs) => {
+    const range = num + type === 'u32' ? 1 : 2;
+    const number =
+    hashU32(..._hashInputs, ...hashInputs) / 0x1_0000_0000 * range - (type === 'u32' ? 0 : 1);
+    return type === 'f32' ? number : Math.floor(number);
+  };
+
   // Samplers across devices use different methods to interpolate.
   // Quantizing the texture coordinates seems to hit coords that produce
   // comparable results to our computed results.
@@ -1809,12 +2216,16 @@ args)
   // Linux, AMD Radeon Pro WX 3200: 256
   // MacOS, M1 Mac: 256
   const kSubdivisionsPerTexel = 4;
-  const q = [
-  textureWidth * kSubdivisionsPerTexel,
-  textureWidth * kSubdivisionsPerTexel,
-  6 * kSubdivisionsPerTexel];
+  const nearest = !args.sampler || args.sampler.minFilter === 'nearest';
+  return coords.map((c, i) => {
+    const mipLevel = args.mipLevel ? makeRangeValue(args.mipLevel, i) : 0;
+    const mipSize = virtualMipSize('2d', size, mipLevel);
+    const q = [
+    mipSize[0] * kSubdivisionsPerTexel,
+    mipSize[0] * kSubdivisionsPerTexel,
+    6 * kSubdivisionsPerTexel];
 
-  return out.map((c) => {
+
     const uvw = convertCubeCoordToNormalized3DTextureCoord(c);
 
     // If this is a corner, move to in so it's not
@@ -1834,7 +2245,12 @@ args)
       // Convert back to texture coords
       return v2 / q[i];
     });
-    return convertNormalized3DTexCoordToCubeCoord(quantizedUVW);
+    const coords = convertNormalized3DTexCoordToCubeCoord(quantizedUVW);
+    return {
+      coords,
+      mipLevel,
+      arrayIndex: args.arrayIndex ? makeRangeValue(args.arrayIndex, i, 2) : undefined
+    };
   });
 }
 
@@ -1870,6 +2286,22 @@ function wgslExpr(data) {
   return data.toString();
 }
 
+function wgslExprFor(data, type) {
+  if (Array.isArray(data)) {
+    switch (data.length) {
+      case 1:
+        return `${type}(${data[0].toString()})`;
+      case 2:
+        return `vec2${type}(${data.map((v) => v.toString()).join(', ')})`;
+      case 3:
+        return `vec3${type}(${data.map((v) => v.toString()).join(', ')})`;
+      default:
+        unreachable();
+    }
+  }
+  return `${type}32(${data.toString()})`;
+}
+
 function binKey(call) {
   const keys = [];
   for (const name of kTextureCallArgNames) {
@@ -1903,8 +2335,16 @@ function buildBinnedCalls(calls) {
       if (name === 'offset') {
         args.push(`/* offset */ ${wgslExpr(value)}`);
       } else {
+        const type =
+        name === 'mipLevel' ?
+        prototype.levelType :
+        name === 'arrayIndex' ?
+        prototype.arrayIndexType :
+        name === 'sampleIndex' ?
+        prototype.sampleIndexType :
+        prototype.coordType;
         args.push(`args.${name}`);
-        fields.push(`@align(16) ${name} : ${wgslTypeFor(value, prototype.coordType)}`);
+        fields.push(`@align(16) ${name} : ${wgslTypeFor(value, type)}`);
       }
     }
   }
@@ -1967,7 +2407,17 @@ export function describeTextureCall(call) {
   for (const name of kTextureCallArgNames) {
     const value = call[name];
     if (value !== undefined) {
-      args.push(`${name}: ${wgslExpr(value)}`);
+      if (name === 'coords') {
+        args.push(`${name}: ${wgslExprFor(value, call.coordType)}`);
+      } else if (name === 'mipLevel') {
+        args.push(`${name}: ${wgslExprFor(value, call.levelType)}`);
+      } else if (name === 'arrayIndex') {
+        args.push(`${name}: ${wgslExprFor(value, call.arrayIndexType)}`);
+      } else if (name === 'sampleIndex') {
+        args.push(`${name}: ${wgslExprFor(value, call.sampleIndexType)}`);
+      } else {
+        args.push(`${name}: ${wgslExpr(value)}`);
+      }
     }
   }
   return `${call.builtin}(${args.join(', ')})`;
@@ -2027,9 +2477,14 @@ calls)
   });
   t.device.queue.writeBuffer(dataBuffer, 0, new Uint32Array(data));
 
+  const { resultType, resultFormat, componentType } = textureType.includes('depth') ?
+  { resultType: 'f32', resultFormat: 'rgba32float', componentType: 'f32' } :
+  getTextureFormatTypeInfo(gpuTexture.format);
+  const returnType = `vec4<${componentType}>`;
+
   const rtWidth = 256;
   const renderTarget = t.createTextureTracked({
-    format: 'rgba32float',
+    format: resultFormat,
     size: { width: rtWidth, height: Math.ceil(calls.length / rtWidth) },
     usage: GPUTextureUsage.COPY_SRC | GPUTextureUsage.RENDER_ATTACHMENT
   });
@@ -2051,15 +2506,15 @@ fn vs_main(@builtin(vertex_index) vertex_index : u32) -> @builtin(position) vec4
 }
 
 @group(0) @binding(0) var          T    : ${textureType};
-@group(0) @binding(1) var          S    : sampler;
+${sampler ? '@group(0) @binding(1) var          S    : sampler' : ''};
 @group(0) @binding(2) var<storage> data : Data;
 
 @fragment
-fn fs_main(@builtin(position) frag_pos : vec4f) -> @location(0) vec4f {
+fn fs_main(@builtin(position) frag_pos : vec4f) -> @location(0) ${returnType} {
   let frag_idx = u32(frag_pos.x) + u32(frag_pos.y) * ${renderTarget.width};
-  var result : vec4f;
+  var result : ${resultType};
 ${body}
-  return result;
+  return ${returnType}(result);
 }
 `;
 
@@ -2083,13 +2538,13 @@ ${body}
     pipelines.set(code, pipeline);
   }
 
-  const gpuSampler = t.device.createSampler(sampler);
+  const gpuSampler = sampler ? t.device.createSampler(sampler) : undefined;
 
   const bindGroup = t.device.createBindGroup({
     layout: pipeline.getBindGroupLayout(0),
     entries: [
     { binding: 0, resource: gpuTexture.createView(viewDescriptor) },
-    { binding: 1, resource: gpuSampler },
+    ...(sampler ? [{ binding: 1, resource: gpuSampler }] : []),
     { binding: 2, resource: { buffer: dataBuffer } }]
 
   });

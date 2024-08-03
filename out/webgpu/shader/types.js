@@ -241,6 +241,11 @@ export function* generateTypes({
 
 
 
+
+
+
+
+
 {
   const scalarInfo = kScalarTypeInfo[baseType];
   if (isAtomic) {
@@ -308,6 +313,8 @@ export function* generateTypes({
     let arrayElementCount = kDefaultArrayLength;
     let supportsAtomics = scalarInfo.supportsAtomics;
     let layout = undefined;
+    let accessSuffixes = undefined;
+    let validLayoutForAddressSpace = true;
     if (scalarInfo.layout) {
       // Compute the layout of the array type.
       // Adjust the array element count or element type as needed.
@@ -318,8 +325,11 @@ export function* generateTypes({
         assert(!isAtomic, 'the uniform case is making vec4 of scalar, which cannot handle atomics');
         arrayElemType = `vec4<${baseType}>`;
         supportsAtomics = false;
+        accessSuffixes = ['.x', '.y', '.z', '.w'];
         const arrayElemLayout = vectorLayout('vec4', baseType);
-        // assert(arrayElemLayout.alignment % 16 === 0); // Callers responsibility to avoid
+        // Arrays in uniform address space have to be 16 byte-aligned.
+        // An array of vec4<f16> is only 8byte aligned.
+        validLayoutForAddressSpace = arrayElemLayout.alignment % 16 === 0;
         arrayElementCount = align(arrayElementCount, 4) / 4;
         const arrayByteSize = arrayElementCount * arrayElemLayout.size;
         layout = { alignment: arrayElemLayout.alignment, size: arrayByteSize };
@@ -343,14 +353,17 @@ export function* generateTypes({
       elementBaseType: `${baseType}`,
       arrayLength: arrayElementCount,
       layout,
-      supportsAtomics
+      supportsAtomics,
+      accessSuffixes
     };
 
-    // Sized
-    yield { type: `array<${arrayElemType},${arrayElementCount}>`, _kTypeInfo: arrayTypeInfo };
-    // Unsized
-    if (addressSpace === 'storage') {
-      yield { type: `array<${arrayElemType}>`, _kTypeInfo: arrayTypeInfo };
+    if (validLayoutForAddressSpace) {
+      // Sized
+      yield { type: `array<${arrayElemType},${arrayElementCount}>`, _kTypeInfo: arrayTypeInfo };
+      // Unsized
+      if (addressSpace === 'storage') {
+        yield { type: `array<${arrayElemType}>`, _kTypeInfo: arrayTypeInfo };
+      }
     }
   }
 

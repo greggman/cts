@@ -504,10 +504,7 @@ Parameters:
       format,
       size: { width, height },
       mipLevelCount: 3,
-      usage:
-        GPUTextureUsage.COPY_DST |
-        GPUTextureUsage.TEXTURE_BINDING |
-        GPUTextureUsage.RENDER_ATTACHMENT,
+      usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
     };
     const { texels, texture } = await createTextureWithRandomDataAndGetTexels(t, descriptor);
     const sampler: GPUSamplerDescriptor = {
@@ -603,10 +600,7 @@ Parameters:
       format,
       size: { width, height },
       mipLevelCount: 3,
-      usage:
-        GPUTextureUsage.COPY_DST |
-        GPUTextureUsage.TEXTURE_BINDING |
-        GPUTextureUsage.RENDER_ATTACHMENT,
+      usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
       ...(t.isCompatibility && { textureBindingViewDimension: '2d-array' }),
     };
     const { texels, texture } = await createTextureWithRandomDataAndGetTexels(t, descriptor);
@@ -712,10 +706,7 @@ Parameters:
     const descriptor: GPUTextureDescriptor = {
       format,
       size,
-      usage:
-        GPUTextureUsage.COPY_DST |
-        GPUTextureUsage.TEXTURE_BINDING |
-        GPUTextureUsage.RENDER_ATTACHMENT,
+      usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
       mipLevelCount: 3,
       ...(t.isCompatibility && { textureBindingViewDimension: viewDimension }),
     };

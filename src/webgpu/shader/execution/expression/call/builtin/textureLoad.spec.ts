@@ -187,10 +187,7 @@ Parameters:
     const descriptor: GPUTextureDescriptor = {
       format,
       size,
-      usage:
-        GPUTextureUsage.COPY_DST |
-        GPUTextureUsage.TEXTURE_BINDING |
-        (canUseAsRenderTarget(format) ? GPUTextureUsage.RENDER_ATTACHMENT : 0),
+      usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
       mipLevelCount: maxMipLevelCount({ size }),
     };
     const { texels, texture } = await createTextureWithRandomDataAndGetTexels(t, descriptor);
@@ -421,10 +418,7 @@ Parameters:
     const descriptor: GPUTextureDescriptor = {
       format,
       size,
-      usage:
-        GPUTextureUsage.COPY_DST |
-        GPUTextureUsage.TEXTURE_BINDING |
-        GPUTextureUsage.RENDER_ATTACHMENT,
+      usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
       mipLevelCount: maxMipLevelCount({ size }),
     };
     const { texels, texture } = await createTextureWithRandomDataAndGetTexels(t, descriptor);

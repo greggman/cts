@@ -23,11 +23,7 @@ A texture gather operation reads from a 2D, 2D array, cube, or cube array textur
 `;
 
 import { makeTestGroup } from '../../../../../../common/framework/test_group.js';
-import {
-  isDepthOrStencilTextureFormat,
-  kCompressedTextureFormats,
-  kEncodableTextureFormats,
-} from '../../../../../format_info.js';
+import { kCompressedTextureFormats, kEncodableTextureFormats } from '../../../../../format_info.js';
 
 import {
   appendComponentTypeForFormatToTextureType,
@@ -35,12 +31,15 @@ import {
   chooseTextureSize,
   createTextureWithRandomDataAndGetTexels,
   doTextureCalls,
+  generateSamplePointsCube,
   generateTextureBuiltinInputs2D,
   isFillable,
+  kCubeSamplePointMethods,
   kSamplePointMethods,
   skipIfNeedsFilteringAndIsUnfilterableOrSelectDevice,
   TextureCall,
   vec2,
+  vec3,
   WGSLTextureSampleTest,
 } from './texture_utils.js';
 import { generateCoordBoundaries, generateOffsets } from './utils.js';
@@ -100,10 +99,7 @@ Parameters:
       format,
       size: { width, height },
       mipLevelCount: 3,
-      usage:
-        GPUTextureUsage.COPY_DST |
-        GPUTextureUsage.TEXTURE_BINDING |
-        (isDepthOrStencilTextureFormat(format) ? GPUTextureUsage.RENDER_ATTACHMENT : 0),
+      usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
     };
     const { texels, texture } = await createTextureWithRandomDataAndGetTexels(t, descriptor);
     const sampler: GPUSamplerDescriptor = {
@@ -163,15 +159,76 @@ Parameters:
  * coords: The texture coordinates
 `
   )
-  .paramsSubcasesOnly(u =>
+  .params(u =>
     u
-      .combine('T', ['f32-only', 'i32', 'u32'] as const)
-      .combine('S', ['clamp-to-edge', 'repeat', 'mirror-repeat'])
+      .combine('format', kTestableColorFormats)
+      .filter(t => isFillable(t.format))
+      .combine('minFilter', ['nearest', 'linear'] as const)
+      .beginSubcases()
       .combine('C', ['i32', 'u32'] as const)
-      .combine('C_value', [-1, 0, 1, 2, 3, 4] as const)
-      .combine('coords', generateCoordBoundaries(3))
+      .combine('samplePoints', kCubeSamplePointMethods)
+      .combine('addressMode', ['clamp-to-edge', 'repeat', 'mirror-repeat'] as const)
   )
-  .unimplemented();
+  .beforeAllSubcases(t => {
+    t.skipIfTextureFormatNotSupported(t.params.format);
+    skipIfNeedsFilteringAndIsUnfilterableOrSelectDevice(t, t.params.minFilter, t.params.format);
+  })
+  .fn(async t => {
+    const { format, C, samplePoints, addressMode, minFilter } = t.params;
+
+    const viewDimension: GPUTextureViewDimension = 'cube';
+    const [width, height] = chooseTextureSize({ minSize: 8, minBlocks: 2, format, viewDimension });
+    const depthOrArrayLayers = 6;
+
+    const descriptor: GPUTextureDescriptor = {
+      format,
+      ...(t.isCompatibility && { textureBindingViewDimension: viewDimension }),
+      size: { width, height, depthOrArrayLayers },
+      usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
+      // MAINTENANCE_TODO: make mipLevelCount always 3
+      mipLevelCount: 1,
+    };
+    const { texels, texture } = await createTextureWithRandomDataAndGetTexels(t, descriptor);
+    const sampler: GPUSamplerDescriptor = {
+      addressModeU: addressMode,
+      addressModeV: addressMode,
+      addressModeW: addressMode,
+      minFilter,
+      magFilter: minFilter,
+      mipmapFilter: minFilter,
+    };
+
+    const calls: TextureCall<vec3>[] = generateSamplePointsCube(50, {
+      method: samplePoints,
+      sampler,
+      descriptor,
+      component: true,
+      textureBuiltin: 'textureGather',
+      hashInputs: [format, C, samplePoints, addressMode, minFilter],
+    }).map(({ coords, component }) => {
+      return {
+        builtin: 'textureGather',
+        component,
+        componentType: C === 'i32' ? 'i' : 'u',
+        coordType: 'f',
+        coords,
+      };
+    });
+    const viewDescriptor = {
+      dimension: viewDimension,
+    };
+    const textureType = appendComponentTypeForFormatToTextureType('texture_cube', format);
+    const results = await doTextureCalls(t, texture, viewDescriptor, textureType, sampler, calls);
+    const res = await checkCallResults(
+      t,
+      { texels, descriptor, viewDescriptor },
+      textureType,
+      sampler,
+      calls,
+      results
+    );
+    t.expectOK(res);
+  });
 
 g.test('sampled_array_2d_coords')
   .specURL('https://www.w3.org/TR/WGSL/#texturegather')

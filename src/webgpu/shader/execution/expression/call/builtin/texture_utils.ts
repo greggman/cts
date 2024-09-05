@@ -3408,6 +3408,17 @@ export async function doTextureCalls<T extends Dimensionality>(
     usage: GPUTextureUsage.COPY_SRC | GPUTextureUsage.RENDER_ATTACHMENT,
   });
 
+  if (textureType === 'texture_cube<f32>') {
+    body = body.replace(/textureGather/g, 'emuTextureGatherCube_f32');
+  } else if (textureType === 'texture_cube_array<f32>') {
+    body = body.replace(
+      /textureGather/g,
+      calls[0].arrayIndexType === 'i'
+        ? 'emuTextureGatherCubeArray_f32_i32'
+        : 'emuTextureGatherCubeArray_f32'
+    );
+  }
+
   const code = `
 ${structs}
 
@@ -3427,6 +3438,100 @@ fn vs_main(@builtin(vertex_index) vertex_index : u32) -> @builtin(position) vec4
 @group(0) @binding(0) var          T    : ${textureType};
 ${sampler ? `@group(0) @binding(1) var          S    : ${samplerType}` : ''};
 @group(0) @binding(2) var<storage> data : Data;
+
+const kFaceUVMatrices = array(
+  mat3x3f( 0,  0,  -2,  0, -2,  0,  1,  1,   1),   // posx
+  mat3x3f( 0,  0,   2,  0, -2,  0, -1,  1,  -1),   // negx
+  mat3x3f( 2,  0,   0,  0,  0,  2, -1,  1,  -1),   // posy
+  mat3x3f( 2,  0,   0,  0,  0, -2, -1, -1,   1),   // negy
+  mat3x3f( 2,  0,   0,  0, -2,  0, -1,  1,   1),   // posz
+  mat3x3f(-2,  0,   0,  0, -2,  0,  1,  1,  -1),   // negz
+);
+
+fn convertCubeCoordToNormalized3DTextureCoord(v: vec3f) -> vec3f {
+  var uvw: vec3f;
+  var layer: i32;
+  let r = normalize(v);
+  let absR = abs(r);
+  if (absR[0] > absR[1] && absR[0] > absR[2]) {
+    // x major
+    let negX = select(0, 1, r[0] < 0.0);
+    uvw = vec3f(select(-r[2], r[2], negX > 0), -r[1], absR[0]);
+    layer = negX;
+  } else if (absR[1] > absR[2]) {
+    // y major
+    let negY = select(0, 1, r[1] < 0.0);
+    uvw = vec3f(r[0], select(r[2], -r[2], negY > 0), absR[1]);
+    layer = 2 + negY;
+  } else {
+    // z major
+    let negZ = select(0, 1, r[2] < 0.0);
+    uvw = vec3f(select(r[0], -r[0], negZ > 0), -r[1], absR[2]);
+    layer = 4 + negZ;
+  }
+  return vec3f((uvw[0] / uvw[2] + 1) * 0.5, (uvw[1] / uvw[2] + 1) * 0.5, (f32(layer) + 0.5) / 6);
+}
+
+fn convertNormalized3DTexCoordToCubeCoord(uvLayer: vec3f) -> vec3f {
+  return normalize(kFaceUVMatrices[u32(min(5, uvLayer.z * 6))] * vec3f(uvLayer.xy, 1));
+}
+
+fn sampleLevel(t: texture_cube<f32>, s: sampler, texelUV: vec2f, face: f32) -> vec4f {
+  let size = textureDimensions(t);
+  let coord = convertNormalized3DTexCoordToCubeCoord(vec3f((texelUV + 0.5) / vec2f(size), face));
+  return textureSampleLevel(t, s, coord, 0);
+}
+
+fn emuTextureGatherCube_f32(c: u32, t: texture_cube<f32>, s: sampler, coord: vec3f) -> vec4f {
+  // convert cube coord to face and texels
+  let size = textureDimensions(t);
+  let uvw = convertCubeCoordToNormalized3DTextureCoord(coord);
+  let texelUV = uvw.xy * vec2f(size) - 0.5;
+  let upperLeft = floor(texelUV);
+  let lowerRight = ceil(texelUV);
+  let lowerLeft = vec2f(upperLeft.x, lowerRight.y);
+  let upperRight = vec2f(lowerRight.x, upperLeft.y);
+
+  let c3 = sampleLevel(t, s, upperLeft, uvw.z);
+  let c0 = sampleLevel(t, s, lowerLeft, uvw.z);
+  let c2 = sampleLevel(t, s, upperRight, uvw.z);
+  let c1 = sampleLevel(t, s, lowerRight, uvw.z);
+
+  return vec4f(c0[c], c1[c], c2[c], c3[c]);
+}
+
+fn sampleLevelArray(t: texture_cube_array<f32>, s: sampler, texelUV: vec2f, face: f32, arrayLayer: u32) -> vec4f {
+  let size = textureDimensions(t);
+  let coord = convertNormalized3DTexCoordToCubeCoord(vec3f((texelUV + 0.5) / vec2f(size), face));
+
+  let uvw = convertCubeCoordToNormalized3DTextureCoord(coord);
+  let texelUV2 = floor(uvw.xy * vec2f(size));
+  let coord2 = convertNormalized3DTexCoordToCubeCoord(vec3f((texelUV2 + 0.5) / vec2f(size), uvw.z));
+
+  return textureSampleLevel(t, s, coord2, arrayLayer, 0);
+}
+
+fn emuTextureGatherCubeArray_f32(c: u32, t: texture_cube_array<f32>, s: sampler, coord: vec3f, arrayLayer: u32) -> vec4f {
+  // convert cube coord to face and texels
+  let size = textureDimensions(t);
+  let uvw = convertCubeCoordToNormalized3DTextureCoord(coord);
+  let texelUV = uvw.xy * vec2f(size) - 0.5;
+  let upperLeft = floor(texelUV);
+  let lowerRight = ceil(texelUV);
+  let lowerLeft = vec2f(upperLeft.x, lowerRight.y);
+  let upperRight = vec2f(lowerRight.x, upperLeft.y);
+
+  let c3 = sampleLevelArray(t, s, upperLeft, uvw.z, arrayLayer);
+  let c0 = sampleLevelArray(t, s, lowerLeft, uvw.z, arrayLayer);
+  let c2 = sampleLevelArray(t, s, upperRight, uvw.z, arrayLayer);
+  let c1 = sampleLevelArray(t, s, lowerRight, uvw.z, arrayLayer);
+
+  return vec4f(c0[c], c1[c], c2[c], c3[c]);
+}
+
+fn emuTextureGatherCubeArray_f32_i32(c: u32, t: texture_cube_array<f32>, s: sampler, coord: vec3f, level: i32) -> vec4f {
+  return emuTextureGatherCubeArray_f32(c, t, s, coord, u32(max(0, level)));
+}
 
 @fragment
 fn fs_main(@builtin(position) frag_pos : vec4f) -> @location(0) ${returnType} {

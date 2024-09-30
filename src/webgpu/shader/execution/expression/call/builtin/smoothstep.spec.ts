@@ -16,6 +16,7 @@ If low >= high:
 import { makeTestGroup } from '../../../../../../common/framework/test_group.js';
 import { GPUTest } from '../../../../../gpu_test.js';
 import { ScalarValue, Type, Value } from '../../../../../util/conversion.js';
+import { clamp } from '../../../../../util/math.js';
 import { Case } from '../../case.js';
 import { allInputSources, onlyConstInputSource, run } from '../../expression.js';
 
@@ -90,4 +91,107 @@ g.test('f16')
       t.params,
       validCases
     );
+  });
+
+g.test('negative')
+  .desc('test negative values that are supposed to be illegal')
+  .fn(async t => {
+    const module = t.device.createShaderModule({
+      code: `
+      @group(0) @binding(0) var<storage> values: array<f32>;
+      @group(0) @binding(1) var<storage, read_write> results: array<f32>;
+
+      @compute @workgroup_size(1) fn cs(
+        @builtin(workgroup_id) workgroup_id : vec3<u32>,
+        @builtin(num_workgroups) num_workgroups: vec3<u32>
+      ) {
+        let workgroup_index =
+          workgroup_id.x +
+          workgroup_id.y * num_workgroups.x +
+          workgroup_id.z * num_workgroups.x * num_workgroups.y;
+
+        results[workgroup_index] = smoothstep(
+          values[workgroup_id.x],
+          values[workgroup_id.y],
+          values[workgroup_id.z],
+        );
+      }
+    `,
+    });
+
+    const pipeline = t.device.createComputePipeline({
+      layout: 'auto',
+      compute: { module },
+    });
+
+    const values = [-100, -10, -1, -0.5, 0, 0.5, 1, -10, -100];
+    const valuesBuffer = t.createBufferTracked({
+      size: values.length * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    t.device.queue.writeBuffer(valuesBuffer, 0, new Float32Array(values));
+
+    const resultsBuffer = t.createBufferTracked({
+      size: values.length * values.length * values.length * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    });
+
+    const copyBuffer = t.createBufferTracked({
+      size: resultsBuffer.size,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+
+    const bindGroup = t.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: valuesBuffer } },
+        { binding: 1, resource: { buffer: resultsBuffer } },
+      ],
+    });
+
+    const encoder = t.device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, bindGroup);
+    pass.dispatchWorkgroups(values.length, values.length, values.length);
+    pass.end();
+    encoder.copyBufferToBuffer(resultsBuffer, 0, copyBuffer, 0, resultsBuffer.size);
+    t.device.queue.submit([encoder.finish()]);
+
+    await copyBuffer.mapAsync(GPUMapMode.READ);
+    const results = new Float32Array(copyBuffer.getMappedRange()).slice();
+    copyBuffer.unmap();
+
+    /*
+    t = clamp((x - edge0) / (edge1 - edge0), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
+    */
+    const smoothStep = (edge0: number, edge1: number, x: number) => {
+      if (edge0 === edge1) {
+        return edge0 < x ? 1 : 0; // should be NaN by definition but!??
+      }
+      const t = clamp((x - edge0) / (edge1 - edge0), { min: 0, max: 1 });
+      return t * t * (3 - 2 * t);
+    };
+
+    const kMaxDiff = 0.000001;
+    const errors = [];
+    for (let z = 0; z < values.length; ++z) {
+      for (let y = 0; y < values.length; ++y) {
+        for (let x = 0; x < values.length; ++x) {
+          const offset = z * values.length * values.length + y * values.length + x;
+          const result = results[offset];
+          const expect = smoothStep(values[x], values[y], values[z]);
+          if (Math.abs(result - expect) > kMaxDiff) {
+            errors.push(
+              `smoothstep(${values[x]}, ${values[y]}, ${values[z]}) expected ${expect}, actual: ${result}`
+            );
+          }
+        }
+      }
+    }
+
+    if (errors.length > 0) {
+      throw new Error(errors.join('\n'));
+    }
   });

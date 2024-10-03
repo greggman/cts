@@ -70,7 +70,6 @@ Parameters:
       .combine('addressModeU', ['clamp-to-edge', 'repeat', 'mirror-repeat'] as const)
       .combine('addressModeV', ['clamp-to-edge', 'repeat', 'mirror-repeat'] as const)
       .combine('minFilter', ['nearest', 'linear'] as const)
-      .combine('bias', [-16.1, -16, -1, 0, 1, 2, 15.99, 16] as const)
       .combine('offset', [false, true] as const)
   )
   .beforeAllSubcases(t =>
@@ -104,11 +103,12 @@ Parameters:
       bias: true,
       offset,
       hashInputs: [format, samplePoints, addressModeU, addressModeV, minFilter, offset],
-    }).map(({ coords, offset, bias }) => {
+    }).map(({ coords, derivativeMult, offset, bias }) => {
       return {
         builtin: 'textureSampleBias',
         coordType: 'f',
         coords,
+        derivativeMult,
         bias,
         offset,
       };

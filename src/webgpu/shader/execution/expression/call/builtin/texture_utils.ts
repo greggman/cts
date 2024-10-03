@@ -851,7 +851,7 @@ type TextureCallArgKeys = keyof TextureCallArgs<vec1>;
 const kTextureCallArgNames: readonly TextureCallArgKeys[] = [
   'component',
   'coords',
-  'derivativeMult',
+  'derivativeMult', // NOTE: derivative mult is used with coords for implicit derivatives.
   'arrayIndex',
   'bias',
   'sampleIndex',
@@ -1394,6 +1394,22 @@ function computeMipLevelFromGradients(
   return mipLevel;
 }
 
+function computeMipLevelFromGradientsForCall<T extends Dimensionality>(
+  call: TextureCall<T>,
+  size: GPUExtent3D
+) {
+  assert(!!call.ddx);
+  assert(!!call.ddy);
+  // ddx and ddy are the values that would be passed to textureSampleGrad
+  // If we're emulating textureSample then they're the computed derivatives
+  // such that if we passed them to textureSampleGrad they'd produce the
+  // same result.
+  const ddx: readonly number[] = typeof call.ddx === 'number' ? [call.ddx] : call.ddx;
+  const ddy: readonly number[] = typeof call.ddy === 'number' ? [call.ddy] : call.ddy;
+
+  return computeMipLevelFromGradients(ddx, ddy, size);
+}
+
 /**
  * The software version of textureSampleGrad except with optional level.
  */
@@ -1405,15 +1421,7 @@ function softwareTextureReadGrad<T extends Dimensionality>(
 ): PerTexelComponent<number> {
   const bias = call.bias === undefined ? 0 : clamp(call.bias, { min: -16.0, max: 15.99 });
   if (call.ddx) {
-    assert(!!call.ddy);
-    // ddx and ddy are the values that would be passed to textureSampleGrad
-    // If we're emulating textureSample then they're the computed derivatives
-    // such that if we passed them to textureSampleGrad they'd produce the
-    // same result.
-    const ddx: readonly number[] = typeof call.ddx === 'number' ? [call.ddx] : call.ddx;
-    const ddy: readonly number[] = typeof call.ddy === 'number' ? [call.ddy] : call.ddy;
-
-    const mipLevel = computeMipLevelFromGradients(ddx, ddy, texture.descriptor.size);
+    const mipLevel = computeMipLevelFromGradientsForCall(call, texture.descriptor.size);
     const weightMipLevel = mapSoftwareMipLevelToGPUMipLevel(t, mipLevel + bias);
     return softwareTextureReadLevel(t, call, texture, sampler, weightMipLevel);
   } else {
@@ -1832,6 +1840,22 @@ export async function checkCallResults<T extends Dimensionality>(
           const t = call.coords!.map((v, i) => (v * mipSize[i]).toFixed(3));
           errs.push(`          : as texel coord @ mip level[${mipLevel}]: (${t.join(', ')})`);
         }
+      }
+      if (builtinNeedsDerivatives(call.builtin)) {
+        const ddx = derivativeForCall<T>(texture, call, true);
+        const ddy = derivativeForCall<T>(texture, call, false);
+        const mipLevel = computeMipLevelFromGradients(ddx, ddy, size);
+        const biasStr = call.bias === undefined ? '' : ' (without bias)';
+        errs.push(`implicit derivative based mip level: ${fix5(mipLevel)}${biasStr}`);
+        if (call.bias) {
+          const clampedBias = clamp(call.bias ?? 0, { min: -16.0, max: 15.99 });
+          errs.push(`\
+                       clamped bias: ${fix5(clampedBias)}
+                mip level with bias: ${fix5(mipLevel + clampedBias)}`);
+        }
+      } else if (call.ddx) {
+        const mipLevel = computeMipLevelFromGradientsForCall(call, size);
+        errs.push(`gradient based mip level: ${mipLevel}`);
       }
       errs.push(`\
        got: ${fix5v(rgbaToArray(gotRGBA))}
@@ -2565,7 +2589,7 @@ async function identifySamplePoints<T extends Dimensionality>(
         const face = kFaceNames[layer % 6];
         lines.push(`layer: ${layer}, cube-layer: ${(layer / 6) | 0} (${face}) ${unSampled}`);
       } else {
-        lines.push(`layer: ${unSampled}`);
+        lines.push(`layer: ${layer} ${unSampled}`);
       }
 
       if (!layerEntries) {
@@ -2911,12 +2935,8 @@ function generateTextureBuiltinInputsImpl<T extends Dimensionality>(
       }) as T;
     };
 
-    // for textureSample, we assume 3 mips so choose a number between
-    // 0 and 1
-    const makeDerivativeMult = (coords: T): T => {
-      // choose a mipLevel from -3 to 4. Negative numbers will also become negative
-      // derivatives but positive mipLevel numbers.
-      const mipLevel = makeRangeValue({ num: 6, type: 'u32' }, i, 7) - 3;
+    // choose a derivative value that will select a mipLevel.
+    const makeDerivativeMult = (coords: T, mipLevel: number): T => {
       // Make an identity vec (all 1s).
       const mult = new Array(coords.length).fill(1);
       // choose one axis to set
@@ -2927,21 +2947,47 @@ function generateTextureBuiltinInputsImpl<T extends Dimensionality>(
       return mult as T;
     };
 
+    // for textureSample, choose a derivative value that will select a mipLevel near
+    // the range of mip levels.
+    const makeDerivativeMultForTextureSample = (coords: T): T => {
+      // choose a mipLevel from -mipLevelCount to mipLevelCount + 1. Negative numbers will also become negative
+      // derivatives but positive mipLevel numbers.
+      const mipLevel =
+        makeRangeValue({ num: mipLevelCount * 2, type: 'u32' }, i, 7) - mipLevelCount;
+      return makeDerivativeMult(coords, mipLevel);
+    };
+
+    // for textureSampleBias we choose a bias between -17 and 17. The GPU is supposed
+    // to clamp between -16.0 and 15.99. We then choose a derivative that with the
+    // bias will produce a mipLevel that's in range for the given bias.
+    const makeBiasAndDerivativeMult = (coords: T): [number, T] => {
+      const bias = roundDownToMultipleOf(
+        makeRangeValue({ num: 34, type: 'f32' }, i, 9) - 17,
+        1 / 7
+      );
+      const mipLevel = makeRangeValue({ num: mipLevelCount, type: 'u32' }) - bias;
+      const derivativeMult = makeDerivativeMult(coords, mipLevel);
+      return [bias, derivativeMult];
+    };
+
+    // If bias is set this is textureSampleBias. If bias is not set but derivatives
+    // is then this is one of the other functions that needs implicit derivatives.
+    const [bias, derivativeMult] = args.bias
+      ? makeBiasAndDerivativeMult(coords)
+      : args.derivatives
+      ? [undefined, makeDerivativeMultForTextureSample(coords)]
+      : [];
+
     return {
       coords,
-      derivativeMult: args.derivatives ? makeDerivativeMult(coords) : undefined,
+      derivativeMult,
       mipLevel,
       sampleIndex: args.sampleIndex ? makeRangeValue(args.sampleIndex, i, 1) : undefined,
       arrayIndex: args.arrayIndex ? makeRangeValue(args.arrayIndex, i, 2) : undefined,
       depthRef: args.depthRef ? makeRangeValue({ num: 1, type: 'f32' }, i, 5) : undefined,
       ddx: args.grad ? makeGradient(7) : undefined,
       ddy: args.grad ? makeGradient(8) : undefined,
-      bias: args.bias
-        ? quantizeMipLevel(
-            makeRangeValue({ num: 6, type: 'f32' }, i, 6) - 3,
-            args.sampler?.mipmapFilter ?? 'nearest'
-          )
-        : undefined,
+      bias,
       offset: args.offset
         ? (coords.map((_, j) => makeIntHashValueRepeatable(-8, 8, i, 3 + j)) as T)
         : undefined,

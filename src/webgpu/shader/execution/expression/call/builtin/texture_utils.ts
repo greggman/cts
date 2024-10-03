@@ -9,11 +9,7 @@ import {
   kEncodableTextureFormats,
   kTextureFormatInfo,
 } from '../../../../../format_info.js';
-import {
-  GPUTest,
-  GPUTestSubcaseBatchState,
-  TextureTestMixinType,
-} from '../../../../../gpu_test.js';
+import { GPUTest, GPUTestSubcaseBatchState } from '../../../../../gpu_test.js';
 import {
   align,
   clamp,
@@ -22,12 +18,9 @@ import {
   lcm,
   lerp,
   quantizeToF32,
-  subtractVectors,
 } from '../../../../../util/math.js';
 import {
-  defaultViewDimensionsForTexture,
   effectiveViewDimensionForDimension,
-  effectiveViewDimensionForTexture,
   physicalMipSizeFromTexture,
   reifyTextureDescriptor,
   SampleCoord,
@@ -854,19 +847,11 @@ export type vec3 = [number, number, number];
 export type vec4 = [number, number, number, number];
 export type Dimensionality = vec1 | vec2 | vec3;
 
-function elemOrZero<T extends Dimensionality>(v: Readonly<T> | undefined, i: number) {
-  return v !== undefined && i < v.length ? v[i] : 0;
-}
-
-function extendWithOnes<T extends Dimensionality>(v: Readonly<T> | number[], length: number) {
-  const ones = new Array<number>(length - v.length).fill(1);
-  return [...v, ...ones];
-}
-
 type TextureCallArgKeys = keyof TextureCallArgs<vec1>;
 const kTextureCallArgNames: readonly TextureCallArgKeys[] = [
   'component',
   'coords',
+  'derivativeMult',
   'arrayIndex',
   'bias',
   'sampleIndex',
@@ -880,6 +865,7 @@ const kTextureCallArgNames: readonly TextureCallArgKeys[] = [
 export interface TextureCallArgs<T extends Dimensionality> {
   component?: number; // Used by textureGather
   coords?: T; // The coord passed
+  derivativeMult?: T;
   mipLevel?: number;
   arrayIndex?: number;
   bias?: number;
@@ -947,6 +933,7 @@ function getCallArgType<T extends Dimensionality>(
 ) {
   switch (argName) {
     case 'coords':
+    case 'derivativeMult':
       return call.coordType;
     case 'component':
       assert(call.componentType !== undefined);
@@ -1341,211 +1328,6 @@ function softwareTextureReadMipLevel<T extends Dimensionality>(
 }
 
 /**
- * Returns the min and max value for all texels samples for  a WGSL builtin texture function
- * for a single mip level
- */
-function softwareTextureReadMipLevelMinMax<T extends Dimensionality>(
-  call: TextureCall<T>,
-  texture: Texture,
-  sampler: GPUSamplerDescriptor | undefined,
-  mipLevel: number
-): PerTexelComponent<number>[] {
-  assert(mipLevel % 1 === 0);
-  const { format } = texture.texels[0];
-  const rep = kTexelRepresentationInfo[format];
-  const textureSize = virtualMipSize(
-    texture.descriptor.dimension || '2d',
-    texture.descriptor.size,
-    mipLevel
-  );
-  const addressMode: GPUAddressMode[] =
-    call.builtin === 'textureSampleBaseClampToEdge'
-      ? ['clamp-to-edge', 'clamp-to-edge', 'clamp-to-edge']
-      : [
-          sampler?.addressModeU ?? 'clamp-to-edge',
-          sampler?.addressModeV ?? 'clamp-to-edge',
-          sampler?.addressModeW ?? 'clamp-to-edge',
-        ];
-
-  const isCube = isCubeViewDimension(texture.viewDescriptor);
-  const arrayIndexMult = isCube ? 6 : 1;
-  const numLayers = textureSize[2] / arrayIndexMult;
-  assert(numLayers % 1 === 0);
-  const textureSizeForCube = [textureSize[0], textureSize[1], 6];
-
-  const load = (at: number[]) => {
-    const zFromArrayIndex =
-      call.arrayIndex !== undefined
-        ? clamp(call.arrayIndex, { min: 0, max: numLayers - 1 }) * arrayIndexMult
-        : 0;
-    return texture.texels[mipLevel].color({
-      x: Math.floor(at[0]),
-      y: Math.floor(at[1] ?? 0),
-      z: Math.floor(at[2] ?? 0) + zFromArrayIndex,
-      sampleIndex: call.sampleIndex,
-    });
-  };
-
-  switch (call.builtin) {
-    case 'textureSample':
-    case 'textureSampleBias':
-    case 'textureSampleGrad':
-    case 'textureSampleLevel': {
-      let coords = toArray(call.coords!);
-
-      if (isCube) {
-        coords = convertCubeCoordToNormalized3DTextureCoord(coords as vec3);
-      }
-
-      // convert normalized to absolute texel coordinate
-      // ┌───┬───┬───┬───┐
-      // │ a │   │   │   │  norm: a = 1/8, b = 7/8
-      // ├───┼───┼───┼───┤   abs: a = 0,   b = 3
-      // │   │   │   │   │
-      // ├───┼───┼───┼───┤
-      // │   │   │   │   │
-      // ├───┼───┼───┼───┤
-      // │   │   │   │ b │
-      // └───┴───┴───┴───┘
-      let at = coords.map((v, i) => v * (isCube ? textureSizeForCube : textureSize)[i] - 0.5);
-
-      // Apply offset in whole texel units
-      // This means the offset is added at each mip level in texels. There's no
-      // scaling for each level.
-      if (call.offset !== undefined) {
-        at = add(at, toArray(call.offset));
-      }
-
-      const samples: number[][] = [];
-
-      const filter = isBuiltinGather(call.builtin) ? 'linear' : sampler?.minFilter ?? 'nearest';
-      switch (filter) {
-        case 'linear': {
-          // 'p0' is the lower texel for 'at'
-          const p0 = at.map(v => Math.floor(v));
-          // 'p1' is the higher texel for 'at'
-          // If it's cube then don't advance Z.
-          const p1 = p0.map((v, i) => v + (isCube ? (i === 2 ? 0 : 1) : 1));
-
-          switch (coords.length) {
-            case 1:
-              samples.push(p0);
-              samples.push(p1);
-              break;
-            case 2: {
-              // Note: These are ordered to match textureGather
-              samples.push([p0[0], p1[1]]);
-              samples.push(p1);
-              samples.push([p1[0], p0[1]]);
-              samples.push(p0);
-              break;
-            }
-            case 3: {
-              // cube sampling, here in the software renderer, is the same
-              // as 2d sampling. We'll sample at most 4 texels. The weights are
-              // the same as if it was just one plane. If the points fall outside
-              // the slice they'll be wrapped by wrapFaceCoordToCubeFaceAtEdgeBoundaries
-              // below.
-              if (isCube) {
-                // Note: These are ordered to match textureGather
-                samples.push([p0[0], p1[1], p0[2]]);
-                samples.push(p1);
-                samples.push([p1[0], p0[1], p0[2]]);
-                samples.push(p0);
-                const ndx = getUnusedCubeCornerSampleIndex(textureSize[0], coords as vec3);
-                if (ndx >= 0) {
-                  // # Issues with corners of cubemaps
-                  //
-                  // note: I tried multiple things here
-                  //
-                  // 1. distribute 1/3 of the weight of the removed sample to each of the remaining samples
-                  // 2. distribute 1/2 of the weight of the removed sample to the 2 samples that are not the "main" sample.
-                  // 3. normalize the weights of the remaining 3 samples.
-                  //
-                  // none of them matched the M1 in all cases. Checking the dEQP I found this comment
-                  //
-                  // > If any of samples is out of both edges, implementations can do pretty much anything according to spec.
-                  // https://github.com/KhronosGroup/VK-GL-CTS/blob/d2d6aa65607383bb29c8398fe6562c6b08b4de57/framework/common/tcuTexCompareVerifier.cpp#L882
-                  //
-                  // If I understand this correctly it matches the OpenGL ES 3.1 spec it says
-                  // it's implementation defined.
-                  //
-                  // > OpenGL ES 3.1 section 8.12.1 Seamless Cubemap Filtering
-                  // >
-                  // > -  If a texture sample location would lie in the texture
-                  // >    border in both u and v (in one of the corners of the
-                  // >    cube), there is no unique neighboring face from which to
-                  // >    extract one texel. The recommended method to generate this
-                  // >    texel is to average the values of the three available
-                  // >    samples. However, implementations are free to construct
-                  // >    this fourth texel in another way, so long as, when the
-                  // >    three available samples have the same value, this texel
-                  // >    also has that value.
-                  //
-                  // I'm not sure what "average the values of the three available samples"
-                  // means. To me that would be (a+b+c)/3 or in other words, set all the
-                  // weights to 0.33333 but that's not what the M1 is doing.
-                  //
-                  // We could check that, given the 3 texels at the corner, if all 3 texels
-                  // are the same value then the result must be the same value. Otherwise,
-                  // the result must be between the 3 values. For now, the code that
-                  // chooses test coordinates avoids corners. This has the restriction
-                  // that the smallest mip level be at least 4x4 so there are some non
-                  // corners to choose from.
-                  unreachable(
-                    `corners of cubemaps are not testable:\n   ${describeTextureCall(call)}`
-                  );
-                }
-              } else {
-                const p = [p0, p1];
-                for (let z = 0; z < 2; ++z) {
-                  for (let y = 0; y < 2; ++y) {
-                    for (let x = 0; x < 2; ++x) {
-                      samples.push([p[x][0], p[y][1], p[z][2]]);
-                    }
-                  }
-                }
-              }
-              break;
-            }
-          }
-          break;
-        }
-        case 'nearest': {
-          const p = at.map(v => Math.round(quantizeToF32(v)));
-          samples.push(p);
-          break;
-        }
-        default:
-          unreachable();
-      }
-
-      const min: PerTexelComponent<number> = {};
-      const max: PerTexelComponent<number> = {};
-      for (const sample of samples) {
-        const c = isCube
-          ? wrapFaceCoordToCubeFaceAtEdgeBoundaries(textureSize[0], sample as vec3)
-          : applyAddressModesToCoords(addressMode, textureSize, sample);
-        const v = load(c);
-        const postV = applyCompare(call, sampler, rep.componentOrder, v);
-        for (const component of rep.componentOrder) {
-          const c = postV[component]!;
-          min[component] = min[component] === undefined ? c : Math.min(c, min[component]!);
-          max[component] = max[component] === undefined ? c : Math.max(c, max[component]!);
-        }
-      }
-
-      return [
-        convertPerTexelComponentToResultFormat(min, format),
-        convertPerTexelComponentToResultFormat(max, format),
-      ];
-    }
-    default:
-      unreachable();
-  }
-}
-
-/**
  * Reads a texture, optionally sampling between 2 mipLevels
  */
 function softwareTextureReadLevel<T extends Dimensionality>(
@@ -1694,6 +1476,18 @@ function derivativeBaseForCall<T extends Dimensionality>(texture: Texture, isDDX
   }
 }
 
+/**
+ * Multiplies derivativeBase by derivativeMult or 1
+ */
+function derivativeForCall<T extends Dimensionality>(
+  texture: Texture,
+  call: TextureCall<T>,
+  isDDX: boolean
+) {
+  const dd = derivativeBaseForCall(texture, isDDX);
+  return dd.map((v, i) => v * (call.derivativeMult?.[i] ?? 1)) as T;
+}
+
 function softwareTextureRead<T extends Dimensionality>(
   t: GPUTest,
   call: TextureCall<T>,
@@ -1704,114 +1498,12 @@ function softwareTextureRead<T extends Dimensionality>(
   if (builtinNeedsDerivatives(call.builtin) && !call.ddx) {
     const newCall: TextureCall<T> = {
       ...call,
-      ddx: call.ddx ?? derivativeBaseForCall<T>(texture, true),
-      ddy: call.ddy ?? derivativeBaseForCall<T>(texture, false),
+      ddx: call.ddx ?? derivativeForCall<T>(texture, call, true),
+      ddy: call.ddy ?? derivativeForCall<T>(texture, call, false),
     };
     call = newCall;
   }
   return softwareTextureReadGrad(t, call, texture, sampler);
-}
-
-/**
- * Returns the min and max values for a set of texels.
- */
-function rgbaTexelMinMax(...texels: PerTexelComponent<number>[]): PerTexelComponent<number>[] {
-  const min: PerTexelComponent<number> = {};
-  const max: PerTexelComponent<number> = {};
-
-  const firstTexel = texels[0];
-  for (const component of kRGBAComponents) {
-    const v = firstTexel[component] ?? 0;
-    min[component] = v;
-    max[component] = v;
-  }
-
-  for (let i = 1; i < texels.length; ++i) {
-    for (const component of kRGBAComponents) {
-      const v = texels[i][component] ?? 0;
-      min[component] = Math.min(min[component]!, v);
-      max[component] = Math.max(max[component]!, v);
-    }
-  }
-
-  return [min, max];
-}
-
-/**
- * The software implementation of textureSampleLevel except it returns the min and max values
- * for all texels read.
- */
-function softwareTextureReadLevelMinMax<T extends Dimensionality>(
-  t: GPUTest,
-  call: TextureCall<T>,
-  texture: Texture,
-  sampler: GPUSamplerDescriptor | undefined,
-  mipLevel: number
-): PerTexelComponent<number>[] {
-  const mipLevelCount = texture.texels.length;
-  const maxLevel = mipLevelCount - 1;
-
-  if (!sampler) {
-    const texel = softwareTextureReadMipLevel<T>(call, texture, sampler, mipLevel);
-    return [texel, texel];
-  }
-
-  const effectiveMipmapFilter = isBuiltinGather(call.builtin) ? 'nearest' : sampler.mipmapFilter;
-  switch (effectiveMipmapFilter) {
-    case 'linear': {
-      const clampedMipLevel = clamp(mipLevel, { min: 0, max: maxLevel });
-      const baseMipLevel = Math.floor(clampedMipLevel);
-      const nextMipLevel = Math.ceil(clampedMipLevel);
-      const [minT0, maxT0] = softwareTextureReadMipLevelMinMax<T>(
-        call,
-        texture,
-        sampler,
-        baseMipLevel
-      );
-      const [minT1, maxT1] = softwareTextureReadMipLevelMinMax<T>(
-        call,
-        texture,
-        sampler,
-        nextMipLevel
-      );
-      return rgbaTexelMinMax(minT0, minT1, maxT0, maxT1);
-    }
-    default: {
-      const baseMipLevel = Math.floor(
-        clamp(mipLevel + 0.5, { min: 0, max: texture.texels.length - 1 })
-      );
-      const texel = softwareTextureReadMipLevel<T>(call, texture, sampler, baseMipLevel);
-      return [texel, texel];
-    }
-  }
-}
-/**
- * The software version of textureSampleGrad builtin except it returns
- * the min and max values of all textures read.
- */
-function softwareTextureReadGradMinMax<T extends Dimensionality>(
-  t: GPUTest,
-  call: TextureCall<T>,
-  texture: Texture,
-  sampler?: GPUSamplerDescriptor
-): PerTexelComponent<number>[] {
-  const bias = call.bias === undefined ? 0 : clamp(call.bias, { min: -16.0, max: 15.99 });
-  if (call.ddx) {
-    assert(call.ddy !== undefined);
-
-    // ddx and ddy are the values that would be passed to textureSampleGrad
-    // If we're emulating textureSample then they're the computed derivatives
-    // such that if we passed them to textureSampleGrad they'd produce the
-    // same result.
-    const ddx: readonly number[] = typeof call.ddx === 'number' ? [call.ddx] : call.ddx;
-    const ddy: readonly number[] = typeof call.ddy === 'number' ? [call.ddy] : call.ddy;
-
-    const mipLevel = computeMipLevelFromGradients(ddx, ddy, texture.descriptor.size);
-    const weightMipLevel = mapSoftwareMipLevelToGPUMipLevel(t, mipLevel + bias);
-    return softwareTextureReadLevelMinMax(t, call, texture, sampler, weightMipLevel);
-  } else {
-    return softwareTextureReadLevelMinMax(t, call, texture, sampler, (call.mipLevel ?? 0) + bias);
-  }
 }
 
 export type TextureTestOptions<T extends Dimensionality> = {
@@ -2196,348 +1888,6 @@ export async function checkCallResults<T extends Dimensionality>(
   return errs.length > 0 ? new Error(errs.join('\n')) : undefined;
 }
 
-function dFdx<T extends Dimensionality>(coord: T, dx: number): T {
-  return coord.map(v => v / dx) as T;
-}
-
-function dFdy<T extends Dimensionality>(coord: T, dy: number): T {
-  return coord.map(v => v / dy) as T;
-}
-
-/**
- * Renders a quad and generates a minTexelView and a maxTexelView
- * where the min view in the minimum value of each texel sampled and
- * and max is the maximum value of each texel sample.
- *
- * In other words. If you call textureSample it's possible that function
- * will read up to 8 texels from a 3d texture in one mip level and another
- * 8 texels from another mip level. This function would return the min
- * and max of all texels sample
- *
- * [
- *   min(allTexelsSampled)
- *   max(allTexelsSampled)
- * ]
- *
- * Concretely, if just 2 texels were sampled
- *
- *    { r: 1, g: 5, b: 12, a: 30 }
- *    { r: 4, g: 2, b: 6,  a: 40 }
- *
- * Then this would return texel views that represented these values
- *
- * [
- *    { r: 1, g: 2, b:  6, a: 30 },  // min
- *    { r: 4, g: 5, b: 12, a: 40 },  // max
- * ]
- *
- */
-function softwareMinMaxRasterize<T extends Dimensionality>(
-  t: GPUTest,
-  texture: Texture,
-  sampler: GPUSamplerDescriptor,
-  targetSize: [number, number],
-  options: TextureTestOptions<T>
-) {
-  const [width, height] = targetSize;
-  const { ddx = 1, ddy = 1, uvwStart } = options;
-  const format = 'rgba32float';
-  const viewDimension =
-    texture.viewDescriptor.dimension ?? defaultViewDimensionsForTexture(texture.descriptor);
-
-  const textureSize = reifyExtent3D(texture.descriptor.size);
-
-  // MAINTENANCE_TODO: Consider passing these in as a similar computation
-  // happens in putDataInTextureThenDrawAndCheckResultsComparedToSoftwareRasterizer.
-  // The issue is there, the calculation is "what do we need to multiply the unitQuad
-  // by to get the derivatives we want". The calculation here is "what coordinate
-  // will we get for a given frag coordinate". It turns out to be the same calculation
-  // but needs rephrasing them so they are more obviously the same would help
-  // consolidate them into one calculation.
-  const screenSpaceUMult = (ddx * width) / textureSize.width;
-  const screenSpaceVMult = (ddy * height) / textureSize.height;
-
-  const rep = kTexelRepresentationInfo[format];
-
-  const expData = [new Float32Array(width * height * 4), new Float32Array(width * height * 4)];
-  for (let cy = 0; cy < height; cy += 2) {
-    for (let cx = 0; cx < width; cx += 2) {
-      const cellCoords: T[] = [];
-      // compute coords for a 2x2 area so we can compute derivatives
-      for (let fy = 0; fy < 2; ++fy) {
-        for (let fx = 0; fx < 2; ++fx) {
-          const x = cx + fx;
-          const y = cy + fy;
-          const fragY = height - y - 1 + 0.5;
-          const fragX = x + 0.5;
-          const coord = [(fragX / width) * screenSpaceUMult + elemOrZero(uvwStart, 0)] as T;
-          if (viewDimension !== '1d') {
-            coord[1] = (fragY / height) * screenSpaceVMult + elemOrZero(uvwStart, 1);
-          }
-          if (
-            viewDimension === '3d' ||
-            viewDimension === 'cube' ||
-            viewDimension === 'cube-array'
-          ) {
-            coord[2] = (fragX / width) * 0.5 + (fragY / height) * 0.5 + elemOrZero(uvwStart, 2);
-          }
-          cellCoords.push(coord);
-        }
-      }
-
-      // We're drawing a quad that's the same size as the target so dx and dy are just 1
-      const dx = 1;
-      const dy = 1;
-      const ddx = dFdx(subtractVectors(cellCoords[1], cellCoords[0]) as T, dx);
-      const ddy = dFdy(subtractVectors(cellCoords[2], cellCoords[0]) as T, dy);
-      // This code calculates the same value that will be passed to
-      // `textureSample` in the fragment shader for a given frag coord (see the
-      // WGSL code which uses the same formula, but using interpolation). That
-      // shader renders a clip space quad and includes a inter-stage "uv"
-      // coordinates that start with a unit quad (0,0) to (1,1) and is
-      // multiplied by ddx,ddy and as added in uStart and vStart
-      //
-      // uv = unitQuad * vec2(ddx, ddy) + vec2(vStart, uStart);
-      //
-      // softwareTextureRead<T> simulates a single call to `textureSample` so
-      // here we're computing the `uv` value that will be passed for a
-      // particular fragment coordinate. fragX / width, fragY / height provides
-      // the unitQuad value.
-      //
-      // ddx and ddy in this case are the derivative values we want to test. We
-      // pass those into the softwareTextureRead<T> as they would normally be
-      // derived from the change in coord.
-      for (let fy = 0; fy < 2; ++fy) {
-        for (let fx = 0; fx < 2; ++fx) {
-          const x = cx + fx;
-          const y = cy + fy;
-          const coords = cellCoords[fy * 2 + fx];
-          const call: TextureCall<T> = {
-            builtin: 'textureSample',
-            coordType: 'f',
-            coords,
-            ddx,
-            ddy,
-            offset: options.offset as T,
-          };
-
-          // Match the shader in drawTexture: If given an arrayIndexType,
-          // chooses a different arrayIndex for each sample.
-          const numLayers =
-            textureSize.depthOrArrayLayers / (isCubeViewDimension(texture.viewDescriptor) ? 6 : 1);
-          switch (options.arrayIndexType) {
-            case 'i':
-              // Choose a number between -1 and numLayers. Both -1 and numLayers are out of bounds.
-              call.arrayIndex = ((x + y) % (numLayers + 2)) - 1;
-              call.arrayIndexType = options.arrayIndexType;
-              break;
-            case 'u':
-              // Choose a number between 0 and numLayers. numLayers is out of bounds.
-              call.arrayIndex = (x + y) % (numLayers + 1);
-              call.arrayIndexType = options.arrayIndexType;
-              break;
-          }
-          const minMaxSamples = softwareTextureReadGradMinMax<T>(t, call, texture, sampler);
-          minMaxSamples.forEach((sample, i) => {
-            const rgba = { R: 0, G: 0, B: 0, A: 1, ...sample };
-            const asRgba32Float = new Float32Array(rep.pack(rgba));
-            expData[i].set(asRgba32Float, (y * width + x) * 4);
-          });
-        }
-      }
-    }
-  }
-
-  return expData.map(data =>
-    TexelView.fromTextureDataByReference(format, new Uint8Array(data.buffer), {
-      bytesPerRow: width * 4 * 4,
-      rowsPerImage: height,
-      subrectOrigin: [0, 0, 0],
-      subrectSize: targetSize,
-    })
-  );
-}
-
-/**
- * Render textured quad to an rgba32float texture.
- */
-
-const s_deviceToDrawTextureShaderModules = new WeakMap<GPUDevice, Map<string, GPUShaderModule>>();
-const s_deviceToDrawTexturePipelines = new WeakMap<GPUDevice, Map<string, GPURenderPipeline>>();
-
-function drawTexture<T extends Dimensionality>(
-  t: GPUTest & TextureTestMixinType,
-  texture: GPUTexture,
-  viewDescriptor: GPUTextureViewDescriptor,
-  samplerDesc: GPUSamplerDescriptor,
-  options: TextureTestOptions<T>
-) {
-  const device = t.device;
-  const { ddx = 1, ddy = 1, uvwStart = [0, 0, 0], offset, arrayIndexType, depthTexture } = options;
-
-  const format = 'rgba32float';
-  const renderTarget = t.createTextureTracked({
-    format,
-    size: [32, 32],
-    usage:
-      GPUTextureUsage.COPY_SRC |
-      GPUTextureUsage.RENDER_ATTACHMENT |
-      GPUTextureUsage.TEXTURE_BINDING,
-  });
-  const viewDimension = effectiveViewDimensionForTexture(texture, viewDescriptor.dimension);
-
-  let textureWGSL;
-  let coordWGSL;
-  switch (viewDimension) {
-    case '2d':
-      textureWGSL = depthTexture ? 'texture_depth_2d' : 'texture_2d<f32>';
-      coordWGSL = 'v.uvw.xy';
-      break;
-    case '2d-array':
-      textureWGSL = depthTexture ? 'texture_depth_2d_array' : 'texture_2d_array<f32>';
-      coordWGSL = 'v.uvw.xy';
-      break;
-    case '3d':
-      textureWGSL = 'texture_3d<f32>';
-      coordWGSL = 'v.uvw';
-      break;
-    case 'cube':
-      textureWGSL = depthTexture ? 'texture_depth_cube' : 'texture_cube<f32>';
-      coordWGSL = 'v.uvw';
-      break;
-    case 'cube-array':
-      textureWGSL = depthTexture ? 'texture_depth_cube_array' : 'texture_cube_array<f32>';
-      coordWGSL = 'v.uvw';
-      break;
-    default:
-      unreachable();
-  }
-
-  // The green, blue, and alpha channels of a depth texture are undefined. The software rasterizer
-  // writes d, 0, 0, 1 so write the same.
-  const depthFill = depthTexture
-    ? ', 0, 0, 1'
-    : isDepthTextureFormat(texture.format)
-    ? '.r, 0, 0, 1'
-    : '';
-
-  // Compute the amount we need to multiply the unitQuad by get the
-  // derivatives we want.
-  const uMult = (ddx * renderTarget.width) / texture.width;
-  const vMult = (ddy * renderTarget.height) / texture.height;
-
-  const numLayers = texture.depthOrArrayLayers / (isCubeViewDimension(viewDescriptor) ? 6 : 1);
-  const arrayIndexWGSL =
-    arrayIndexType === 'i'
-      ? `, arrayIndexAsI32(v)`
-      : arrayIndexType === 'u'
-      ? ', arrayIndexAsU32(v)'
-      : '';
-  const offsetWGSL = offset ? `, ${wgslExprT(offset)}` : '';
-  const uvStartWGSL = wgslExprT(extendWithOnes(uvwStart, 3));
-  const uvMultWGSL = wgslExprT([uMult, vMult, 1.0]);
-
-  const code = `
-struct InOut {
-  @builtin(position) pos: vec4f,
-  @location(0) uvw: vec3f,
-};
-
-@vertex fn vs(@builtin(vertex_index) vertex_index : u32) -> InOut {
-  let positions = array(
-    vec3f(-1,  1, 0.5), vec3f( 1,  1, 1  ),
-    vec3f(-1, -1,   0), vec3f( 1, -1, 0.5),
-  );
-  let pos = positions[vertex_index];
-  return InOut(
-    vec4f(pos, 1),
-    (pos * vec3f(0.5, 0.5, 1.0) + vec3f(0.5, 0.5, 0.0)) * ${uvMultWGSL} + ${uvStartWGSL},
-  );
-}
-
-@group(0) @binding(0) var          T    : ${textureWGSL};
-@group(0) @binding(1) var          S    : sampler;
-
-// returns -1 to depthOrArrayLayers inclusive
-fn arrayIndexAsI32(v: InOut) -> i32 {
-  return (i32(v.pos.x) + i32(v.pos.y)) % ${numLayers + 2} - 1;
-}
-
-// returns 0 to depthOrArrayLayers inclusive
-fn arrayIndexAsU32(v: InOut) -> u32 {
-  return (u32(v.pos.x) + u32(v.pos.y)) % ${numLayers + 1};
-}
-
-// return a value between -3 and +3
-fn bias(v: InOut) -> f32 {
-  return f32(u32(v.pos.x) + u32(v.pos.y) * ${renderTarget.width}) /
-         f32(${renderTarget.width} * ${renderTarget.height}) * 6.0 - 3.0;
-}
-
-@fragment fn fs(v: InOut) -> @location(0) vec4f {
-  return vec4f(textureSample(T, S, ${coordWGSL}${arrayIndexWGSL}${offsetWGSL})${depthFill});
-}
-`;
-
-  const tex = t.createTextureTracked({
-    size: [8, 8, 8],
-    dimension: '3d',
-    mipLevelCount: 3,
-    format: 'r8unorm',
-    usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
-  });
-  device.queue.writeTexture(
-    { texture: tex, mipLevel: 1 },
-    new Uint8Array(4 * 4 * 4).fill(0xff),
-    { bytesPerRow: 4, rowsPerImage: 4 },
-    [4, 4, 4]
-  );
-
-  const shaderModules = s_deviceToDrawTextureShaderModules.get(device) ?? new Map();
-  s_deviceToDrawTextureShaderModules.set(device, shaderModules);
-  const shaderModule = shaderModules.get(code) ?? device.createShaderModule({ code });
-  shaderModules.set(code, shaderModule);
-
-  const id = `${format}:${code}`;
-  const pipelines = s_deviceToDrawTexturePipelines.get(device) ?? new Map();
-  const pipeline =
-    pipelines.get(id) ??
-    device.createRenderPipeline({
-      layout: 'auto',
-      vertex: { module: shaderModule },
-      fragment: {
-        module: shaderModule,
-        targets: [{ format }],
-      },
-      primitive: { topology: 'triangle-strip' },
-    });
-  pipelines.set(id, pipeline);
-
-  const sampler = device.createSampler(samplerDesc);
-
-  const bindGroup = device.createBindGroup({
-    layout: pipeline.getBindGroupLayout(0),
-    entries: [
-      { binding: 0, resource: texture.createView({ dimension: viewDimension }) },
-      { binding: 1, resource: sampler },
-    ],
-  });
-
-  const encoder = device.createCommandEncoder();
-
-  const renderPass = encoder.beginRenderPass({
-    colorAttachments: [{ view: renderTarget.createView(), loadOp: 'clear', storeOp: 'store' }],
-  });
-
-  renderPass.setPipeline(pipeline);
-  renderPass.setBindGroup(0, bindGroup);
-  renderPass.draw(4);
-  renderPass.end();
-  device.queue.submit([encoder.finish()]);
-
-  return renderTarget;
-}
-
 function getMaxFractionalDiffForTextureFormat(format: GPUTextureFormat) {
   // Note: I'm not sure what we should do here. My assumption is, given texels
   // have random values, the difference between 2 texels can be very large. In
@@ -2600,124 +1950,14 @@ function getMaxFractionalDiffForTextureFormat(format: GPUTextureFormat) {
   }
 }
 
-function expectMinMaxTexelViewComparisonIsOkInTexture(
-  t: GPUTest,
-  texture: GPUTexture,
-  minTexelView: TexelView,
-  maxTexelView: TexelView,
-  maxFractionalDiff: number
-) {
-  assert(texture.mipLevelCount === 1);
-  assert(texture.dimension === '2d');
-  assert(texture.depthOrArrayLayers === 1);
-  assert(texture.format === 'rgba32float');
-
-  const fix5 = (n: number) => n.toFixed(5);
-  const pad2 = (n: number) => n.toString().padStart(2);
-  const compare = async () => {
-    const descriptor: Omit<GPUTextureDescriptor, 'format' | 'usage'> = { size: texture };
-    const actualTexels = (await readTextureToTexelViews(t, texture, descriptor, 'rgba32float'))[0];
-    const errors: string[] = [];
-    const kMaxErrors = 20;
-    let allMin: number | undefined;
-    let allMax: number | undefined;
-    for (let y = 0; y < texture.height && errors.length < kMaxErrors; ++y) {
-      for (let x = 0; x < texture.width && errors.length < kMaxErrors; ++x) {
-        const coord = { x, y, z: 0 };
-        const minTexel = minTexelView.color(coord);
-        const maxTexel = maxTexelView.color(coord);
-        const actualTexel = actualTexels.color(coord);
-        for (const component of kRGBAComponents) {
-          const minT = minTexel[component]!;
-          const maxT = maxTexel[component]!;
-          assert(minT <= maxT);
-
-          // add some tolerance
-          const min = minT - maxFractionalDiff;
-          const max = maxT + maxFractionalDiff;
-
-          const actual = actualTexel[component]!;
-          allMin = allMin === undefined ? min : Math.min(allMin, min);
-          allMax = allMax === undefined ? max : Math.max(allMax, max);
-
-          if (actual < min || actual > max) {
-            errors.push(
-              `texel at ${pad2(x)}, ${pad2(y)}, component: ${component} was ${fix5(
-                actual
-              )} expected to between ${fix5(min)} and ${fix5(max)}`
-            );
-          }
-        }
-      }
-    }
-    const range = allMax! - allMin!;
-    assert(!isNaN(range));
-    assert(range > 0, 'the texture was a solid color');
-    if (errors.length > 0) {
-      return Error(errors.join('\n'));
-    }
-    return undefined;
-  };
-
-  t.eventualExpectOK(compare());
-}
-
-function checkTextureValuesAreBetweenMinMaxTexelViews(
-  t: GPUTest & TextureTestMixinType,
-  format: GPUTextureFormat,
-  actualTexture: GPUTexture,
-  minTexelView: TexelView,
-  maxTexelView: TexelView
-) {
-  const maxFractionalDiff = getMaxFractionalDiffForTextureFormat(format);
-  expectMinMaxTexelViewComparisonIsOkInTexture(
-    t,
-    actualTexture,
-    minTexelView,
-    maxTexelView,
-    maxFractionalDiff
-  );
-}
-
-/**
- * Puts data in a texture. Renders a quad to a rgba32float. Then "software renders"
- * to a TexelView the expected result and compares the rendered texture to the
- * expected TexelView.
- */
-export async function putDataInTextureThenDrawAndCheckResultsComparedToSoftwareRasterizer<
-  T extends Dimensionality,
->(
-  t: GPUTest & TextureTestMixinType,
-  descriptor: GPUTextureDescriptor,
-  viewDescriptor: GPUTextureViewDescriptor,
-  samplerDesc: GPUSamplerDescriptor,
-  options: TextureTestOptions<T>
-) {
-  const { texture, texels } = await createTextureWithRandomDataAndGetTexels(t, descriptor);
-
-  const actualTexture = drawTexture(t, texture, viewDescriptor, samplerDesc, options);
-
-  const [minTexelView, maxTexelView] = softwareMinMaxRasterize<T>(
-    t,
-    { descriptor, texels, viewDescriptor },
-    samplerDesc,
-    [actualTexture.width, actualTexture.height],
-    options
-  );
-
-  checkTextureValuesAreBetweenMinMaxTexelViews(
-    t,
-    texture.format,
-    actualTexture,
-    minTexelView,
-    maxTexelView
-  );
-}
-
 const sumOfCharCodesOfString = (s: unknown) =>
   String(s)
     .split('')
     .reduce((sum, c) => sum + c.charCodeAt(0), 0);
+
+function roundDownToMultipleOf(v: number, multiple: number) {
+  return Math.floor(v / multiple) * multiple;
+}
 
 /**
  * Makes a function that fills a block portion of a Uint8Array with random valid data
@@ -3476,6 +2716,7 @@ type TextureBuiltinInputArgs = {
   textureBuiltin?: TextureBuiltin;
   descriptor: GPUTextureDescriptor;
   sampler?: GPUSamplerDescriptor;
+  derivatives?: boolean;
   mipLevel?: RangeDef;
   sampleIndex?: RangeDef;
   arrayIndex?: RangeDef;
@@ -3504,6 +2745,7 @@ function generateTextureBuiltinInputsImpl<T extends Dimensionality>(
       })
 ): {
   coords: T;
+  derivativeMult?: T;
   ddx?: T;
   ddy?: T;
   mipLevel: number;
@@ -3669,8 +2911,25 @@ function generateTextureBuiltinInputsImpl<T extends Dimensionality>(
       }) as T;
     };
 
+    // for textureSample, we assume 3 mips so choose a number between
+    // 0 and 1
+    const makeDerivativeMult = (coords: T): T => {
+      // choose a mipLevel from -3 to 4. Negative numbers will also become negative
+      // derivatives but positive mipLevel numbers.
+      const mipLevel = makeRangeValue({ num: 6, type: 'u32' }, i, 7) - 3;
+      // Make an identity vec (all 1s).
+      const mult = new Array(coords.length).fill(1);
+      // choose one axis to set
+      const ndx = makeRangeValue({ num: coords.length - 1, type: 'u32' }, i, 8);
+      assert(ndx < coords.length);
+      // Align to 3rds to avoid edge cases.
+      mult[ndx] = Math.pow(2, roundDownToMultipleOf(mipLevel, 1 / 3));
+      return mult as T;
+    };
+
     return {
       coords,
+      derivativeMult: args.derivatives ? makeDerivativeMult(coords) : undefined,
       mipLevel,
       sampleIndex: args.sampleIndex ? makeRangeValue(args.sampleIndex, i, 1) : undefined,
       arrayIndex: args.arrayIndex ? makeRangeValue(args.arrayIndex, i, 2) : undefined,
@@ -3885,6 +3144,7 @@ export function generateSamplePointsCube(
       })
 ): {
   coords: vec3;
+  derivativeMult?: vec3;
   ddx?: vec3;
   ddy?: vec3;
   mipLevel: number;
@@ -4135,9 +3395,24 @@ export function generateSamplePointsCube(
       ) as T;
     };
 
+    // for textureSample, we assume 3 mips so choose a number between
+    // 0 and 1
+    const makeDerivativeMult = (coords: vec3): vec3 => {
+      // choose a number from -3 to 4
+      const mipLevel = makeRangeValue({ num: 6, type: 'u32' }, i, 7) - 3;
+      const mult = new Array(coords.length).fill(1);
+      // choose one axis to set
+      const ndx = makeRangeValue({ num: coords.length - 1, type: 'u32' }, i, 8);
+      assert(ndx < coords.length);
+      // Align to 3rds to avoid edge cases.
+      mult[ndx] = Math.pow(2, roundDownToMultipleOf(mipLevel, 1 / 3));
+      return mult as vec3;
+    };
+
     const coords = convertNormalized3DTexCoordToCubeCoord(quantizedUVW);
     return {
       coords,
+      derivativeMult: args.derivatives ? makeDerivativeMult(coords) : undefined,
       ddx: args.grad ? makeGradient(7) : undefined,
       ddy: args.grad ? makeGradient(8) : undefined,
       mipLevel,
@@ -4204,19 +3479,6 @@ function wgslExprFor(data: number | vec1 | vec2 | vec3 | vec4, type: 'f' | 'i' |
   return `${type}32(${data.toString()})`;
 }
 
-function wgslExprT<T extends Dimensionality | number[]>(data: Readonly<T> | number[]): string {
-  switch (data.length) {
-    case 1:
-      return data[0].toString();
-    case 2:
-      return `vec2(${data.map(v => v.toString()).join(', ')})`;
-    case 3:
-      return `vec3(${data.map(v => v.toString()).join(', ')})`;
-    default:
-      unreachable();
-  }
-}
-
 function binKey<T extends Dimensionality>(call: TextureCall<T>): string {
   const keys: string[] = [];
   for (const name of kTextureCallArgNames) {
@@ -4269,13 +3531,15 @@ function buildBinnedCalls<T extends Dimensionality>(calls: TextureCall<T>[]) {
             : name === 'bias' || name === 'depthRef' || name === 'ddx' || name === 'ddy'
             ? 'f'
             : prototype.coordType;
-        args.push(
-          `args.${name}${
-            name === 'coords' && builtinNeedsDerivatives(prototype.builtin)
-              ? ' + derivativeBase'
-              : ''
-          }`
-        );
+        if (name !== 'derivativeMult') {
+          args.push(
+            `args.${name}${
+              name === 'coords' && builtinNeedsDerivatives(prototype.builtin)
+                ? ' + derivativeBase * args.derivativeMult'
+                : ''
+            }`
+          );
+        }
         fields.push(`@align(16) ${name} : ${wgslTypeFor(value, type)}`);
       }
     }
@@ -4340,8 +3604,14 @@ function describeTextureCall<T extends Dimensionality>(call: TextureCall<T>): st
     const value = call[name];
     if (value !== undefined && name !== 'component') {
       if (name === 'coords') {
-        const derivativeWGSL = builtinNeedsDerivatives(call.builtin) ? ' + derivativeBase' : '';
+        const derivativeWGSL = builtinNeedsDerivatives(call.builtin)
+          ? ` + derivativeBase * derivativeMult(${
+              call.derivativeMult ? wgslExprFor(call.derivativeMult, call.coordType) : '1'
+            })`
+          : '';
         args.push(`${name}: ${wgslExprFor(value, call.coordType)}${derivativeWGSL}`);
+      } else if (name === 'derivativeMult') {
+        // skip this - it's covered in 'coords'
       } else if (name === 'ddx' || name === 'ddy') {
         args.push(`${name}: ${wgslExprFor(value, call.coordType)}`);
       } else if (name === 'mipLevel') {
@@ -4462,7 +3732,7 @@ export async function doTextureCalls<T extends Dimensionality>(
   binned.forEach((binCalls, binIdx) => {
     const b = buildBinnedCalls(binCalls.map(callIdx => calls[callIdx]));
     structs += `struct Args${binIdx} {
-  ${b.fields.join(',  \n')}
+  ${b.fields.join(',\n  ')}
 }
 `;
     dataFields += `  args${binIdx} : array<Args${binIdx}, ${binCalls.length}>,

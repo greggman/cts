@@ -60,6 +60,7 @@ import {
 } from './util/texture/texture_ok.js';
 import { createTextureFromTexelViews } from './util/texture.js';
 import { reifyExtent3D, reifyOrigin3D } from './util/unions.js';
+import { getWebGPUMemoryUsage } from './util/webgpu_memory.js';
 
 const devicePool = new DevicePool();
 
@@ -111,6 +112,8 @@ export class GPUTestSubcaseBatchState extends SubcaseBatchState {
       this.provider?.then(x => devicePool.release(x)),
       this.mismatchedProvider?.then(x => devicePool.release(x)),
     ]);
+
+    this.recorder.info(new Error(JSON.stringify(getWebGPUMemoryUsage(), null, 2)));
   }
 
   /** @internal MAINTENANCE_TODO: Make this not visible to test code? */
@@ -1225,6 +1228,7 @@ export class GPUTest extends GPUTestBase {
   // Should never be undefined in a test. If it is, init() must not have run/finished.
   private provider: DeviceProvider | undefined;
   private mismatchedProvider: DeviceProvider | undefined;
+  private showMemoryOnce = true;
 
   override async init() {
     await super.init();
@@ -1244,7 +1248,12 @@ export class GPUTest extends GPUTestBase {
    */
   override get device(): GPUDevice {
     assert(this.provider !== undefined, 'internal error: DeviceProvider missing');
-    return this.provider.device;
+    const device = this.provider.device;
+    if (this.showMemoryOnce) {
+      this.showMemoryOnce = false;
+      this.info(JSON.stringify(getWebGPUMemoryUsage(), null, 2));
+    }
+    return device;
   }
 
   /**

@@ -2190,7 +2190,7 @@ export async function checkCallResults<T extends Dimensionality>(
         maxFractionalDiff
       )
     ) {
-      continue;
+  //    continue;
     }
 
     if (!sampler && okBecauseOutOfBounds(texture, call, gotRGBA, maxFractionalDiff)) {
@@ -2208,6 +2208,7 @@ export async function checkCallResults<T extends Dimensionality>(
         : kRComponent;
 
     let bad = false;
+  bad = true;
     const diffs = rgbaComponentsToCheck.map(component => {
       const g = gotRGBA[component]!;
       const e = expectRGBA[component]!;

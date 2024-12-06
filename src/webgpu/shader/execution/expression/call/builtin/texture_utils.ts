@@ -2523,7 +2523,7 @@ export async function checkCallResults<T extends Dimensionality>(
 `);
 
       if (sampler) {
-        if (t.rec.debugging) {
+        /*if (t.rec.debugging)*/ {
           // For compares, we can't use the builtin (textureXXXCompareXXX) because it only
           // returns 0 or 1 or the average of 0 and 1 for multiple samples. And, for example,
           // if the comparison is `always` then every sample returns 1. So we need to use the

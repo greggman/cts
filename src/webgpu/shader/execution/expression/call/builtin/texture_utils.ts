@@ -2346,6 +2346,7 @@ export async function checkCallResults<T extends Dimensionality>(
 
   for (let callIdx = 0; callIdx < calls.length; callIdx++) {
     const call = calls[callIdx];
+    t.debug(`${callIdx}: ${describeTextureCall(call)}`);
     const gotRGBA = results.results[callIdx];
     const expectRGBA = softwareTextureRead(t, stage, call, softwareTexture, sampler);
     // Issues with textureSampleBias
@@ -5102,7 +5103,122 @@ ${body}
 }
 
 ${stageWGSL}
-`;
+
+fn convertCubeCoordToNormalized3DTextureCoord(v: vec3f) -> vec3f {
+  var uvw: vec3f;
+  var layer: f32;
+  let r = normalize(v);
+  let absR = abs(r);
+
+  // 0 [-z, -y, aX]   [-3, -2, 0]
+  // 1 [ z, -y, aX]   [ 3, -2, 1]
+  // 2 [ x,  z, aY]   [ 1,  3, 2]
+  // 3 [ x, -z, aY]   [ 1, -3, 3]
+  // 4 [ x, -y, aZ]   [ 1, -2, 4]
+  // 5 [-x, -y, aZ]   [-1, -2, 5]
+
+  if (absR.x > absR.y && absR.x > absR.z) {
+    // x major
+    if (r.x >= 0.0) {
+      uvw = vec3f(-r.z, -r.y, absR.x);
+      layer = 0;
+    } else {
+      uvw = vec3f(r.z, -r.y, absR.x);
+      layer = 1;
+    }
+  } else if (absR.y > absR.z) {
+    // y major
+    if (r.y >= 0.0) {
+      uvw = vec3f(r.x, r.z, absR.y);
+      layer = 2;
+    } else {
+      uvw = vec3f(r.x, -r.z, absR.y);
+      layer = 3;
+    }
+  } else {
+    // z major
+    if (r.z >= 0.0) {
+      uvw = vec3f(r.x, -r.y, absR.z);
+      layer = 4;
+    } else {
+      uvw = vec3f(-r.x, -r.y, absR.z);
+      layer = 5;
+    }
+  }
+  return vec3f((uvw.xy / uvw.z + 1.0) * 0.5, (layer + 0.5) / 6.0);
+}
+
+const faceMat = array(
+  mat3x3f( 0,  0,  -2,  0, -2,   0,  1,  1,   1),   // +x
+  mat3x3f( 0,  0,   2,  0, -2,   0, -1,  1,  -1),   // -x
+  mat3x3f( 2,  0,   0,  0,  0,   2, -1,  1,  -1),   // +y
+  mat3x3f( 2,  0,   0,  0,  0,  -2, -1, -1,   1),   // -y
+  mat3x3f( 2,  0,   0,  0, -2,   0, -1,  1,   1),   // +z
+  mat3x3f(-2,  0,   0,  0, -2,   0,  1,  1,  -1));  // -z
+
+fn convertNormalized3DTexCoordToCubeCoord(uvLayer: vec3f) -> vec3f {
+  let layer = u32(uvLayer.z * 6.0);
+  return normalize(faceMat[layer] * vec3f(uvLayer.xy, 1));
+}
+
+fn textureGatherCubeEmu(component: u32, t: texture_cube<f32>, s: sampler, coord: vec3f) -> vec4f {
+  let uvLayer = convertCubeCoordToNormalized3DTextureCoord(coord);
+  let size = vec2f(textureDimensions(t));
+  let texelCoord = uvLayer.xy * size - 0.5;
+  let lo = floor(texelCoord);
+  let hi = ceil(texelCoord);
+
+  var coords: array<vec2f, 4>;
+  coords[0] = vec2f(lo.x, hi.y);
+  coords[1] = hi;
+  coords[2] = vec2f(hi.x, lo.y);
+  coords[3] = lo;
+
+  var texel: vec4f;
+  for (var i = 0; i < 4; i++) {
+    /*
+      "uv" coord computed from 2d gather coords
+                                         │
+                                         V
+           ────── +z face ─────────┐────────────
+                                   │    /
+                                   │   /
+                                   │  /
+       quantized "newCubeCoord" -->│ /
+                                   │/
+                                   /<--- un-quantized wrapped "cubeCoord"
+          Inside cube             /│
+                                 / │
+                                /  │+x
+                               /   │face
+                              /    │
+       "cubeCoord" direction /     │
+        that crosses face boundary
+    */
+
+    let uv = (coords[i] + 0.5) / size;
+    // Note: There may be faster ways of wrapping the coords
+    let cubeCoord = convertNormalized3DTexCoordToCubeCoord(vec3f(uv, uvLayer.z));
+    //let value = textureSampleLevel(t, s, cubeCoord, 0);
+
+    //let uvl = convertCubeCoordToNormalized3DTextureCoord(cubeCoord);
+    //let newCubeCoord = convertNormalized3DTexCoordToCubeCoord(uvl);
+    //let value = textureSampleLevel(t, s, newCubeCoord, 0);
+
+    // convert back to uvLayer so we can quantize
+    // There might be faster ways to quantize as well.
+    let uvl = convertCubeCoordToNormalized3DTextureCoord(cubeCoord);
+    let txlCoord = floor(uvl.xy * size);
+    let newUv = (txlCoord + 0.5) / size;
+    let newCubeCoord = convertNormalized3DTexCoordToCubeCoord(vec3f(newUv, uvl.z));
+    let value = textureSampleLevel(t, s, newCubeCoord, 0);
+    texel[i] = value[component];
+  }
+  return texel;
+}
+`.replaceAll(/\btextureGather\b/g, (s: string) => {
+    return textureType === 'texture_cube<f32>' ? 'textureGatherCubeEmu' : s;
+  });
 
   const pipelines =
     s_deviceToPipelines.get(t.device) ?? new Map<string, GPURenderPipeline | GPUComputePipeline>();

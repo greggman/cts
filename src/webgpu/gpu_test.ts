@@ -1,14 +1,15 @@
+// MAINTENANCE_TODO: Remove all deprecated functions once they are no longer in use.
 import {
   Fixture,
   FixtureClass,
   FixtureClassInterface,
   FixtureClassWithMixin,
-  SkipTestCase,
   SubcaseBatchState,
   TestCaseRecorder,
   TestParams,
 } from '../common/framework/fixture.js';
-import { globalTestConfig } from '../common/framework/test_config.js';
+import { registerShutdownTask } from '../common/framework/on_shutdown.js';
+import { globalTestConfig, isCompatibilityDevice } from '../common/framework/test_config.js';
 import { getGPU } from '../common/util/navigator_gpu.js';
 import {
   assert,
@@ -21,27 +22,38 @@ import {
   unreachable,
 } from '../common/util/util.js';
 
-import {
-  getDefaultLimits,
-  kLimits,
-  kQueryTypeInfo,
-  WGSLLanguageFeature,
-} from './capability_info.js';
+import { kLimits, kQueryTypeInfo, WGSLLanguageFeature } from './capability_info.js';
 import { InterpolationType, InterpolationSampling } from './constants.js';
 import {
-  kTextureFormatInfo,
   kEncodableTextureFormats,
   resolvePerAspectFormat,
   SizedTextureFormat,
   EncodableTextureFormat,
   isCompressedTextureFormat,
   ColorTextureFormat,
+  getRequiredFeatureForTextureFormat,
   isTextureFormatUsableAsStorageFormat,
+  isTextureFormatUsableAsRenderAttachment,
+  isTextureFormatMultisampled,
+  is32Float,
+  isSintOrUintFormat,
+  isTextureFormatResolvable,
+  isTextureFormatUsableAsReadWriteStorageTexture,
+  isDepthTextureFormat,
+  isStencilTextureFormat,
+  getBlockInfoForTextureFormat,
+  getBlockInfoForColorTextureFormat,
 } from './format_info.js';
 import { checkElementsEqual, checkElementsBetween } from './util/check_contents.js';
 import { CommandBufferMaker, EncoderType } from './util/command_buffer_maker.js';
 import { ScalarType } from './util/conversion.js';
-import { DevicePool, DeviceProvider, UncanonicalizedDeviceDescriptor } from './util/device_pool.js';
+import {
+  CanonicalDeviceDescriptor,
+  DescriptorModifier,
+  DevicePool,
+  DeviceProvider,
+  UncanonicalizedDeviceDescriptor,
+} from './util/device_pool.js';
 import { align, roundDown } from './util/math.js';
 import { physicalMipSizeFromTexture, virtualMipSize } from './util/texture/base.js';
 import {
@@ -61,18 +73,36 @@ import {
 import { createTextureFromTexelViews } from './util/texture.js';
 import { reifyExtent3D, reifyOrigin3D } from './util/unions.js';
 
+// Declarations for WebGPU items we want tests for that are not yet officially part of the spec.
+declare global {
+  // MAINTENANCE_TODO: remove once added to @webgpu/types
+  interface GPUSupportedLimits {
+    readonly maxStorageBuffersInFragmentStage?: number;
+    readonly maxStorageTexturesInFragmentStage?: number;
+    readonly maxStorageBuffersInVertexStage?: number;
+    readonly maxStorageTexturesInVertexStage?: number;
+  }
+}
+
 const devicePool = new DevicePool();
 
 // MAINTENANCE_TODO: When DevicePool becomes able to provide multiple devices at once, use the
 // usual one instead of a new one.
 const mismatchedDevicePool = new DevicePool();
 
+// On shutdown, try to explicitly destroy() the device pools (and devices) used by GPUTest,
+// so they don't keep using system resources until they're fully garbage collected.
+registerShutdownTask(() => {
+  devicePool.destroy();
+  mismatchedDevicePool.destroy();
+});
+
 const kResourceStateValues = ['valid', 'invalid', 'destroyed'] as const;
 export type ResourceState = (typeof kResourceStateValues)[number];
 export const kResourceStates: readonly ResourceState[] = kResourceStateValues;
 
 /** Various "convenient" shorthands for GPUDeviceDescriptors for selectDevice functions. */
-type DeviceSelectionDescriptor =
+export type DeviceSelectionDescriptor =
   | UncanonicalizedDeviceDescriptor
   | GPUFeatureName
   | undefined
@@ -80,7 +110,7 @@ type DeviceSelectionDescriptor =
 
 export function initUncanonicalizedDeviceDescriptor(
   descriptor: DeviceSelectionDescriptor
-): UncanonicalizedDeviceDescriptor | undefined {
+): UncanonicalizedDeviceDescriptor {
   if (typeof descriptor === 'string') {
     return { requiredFeatures: [descriptor] };
   } else if (descriptor instanceof Array) {
@@ -88,7 +118,24 @@ export function initUncanonicalizedDeviceDescriptor(
       requiredFeatures: descriptor.filter(f => f !== undefined) as GPUFeatureName[],
     };
   } else {
-    return descriptor;
+    return descriptor ?? {};
+  }
+}
+
+type DeviceDescriptorSimplified = {
+  requiredFeatures: GPUFeatureName[];
+  requiredLimits: Record<string, number>;
+  defaultQueue: GPUQueueDescriptor;
+};
+
+function mergeDeviceSelectionDescriptorIntoDeviceDescriptor(
+  src: DeviceSelectionDescriptor,
+  dst: DeviceDescriptorSimplified
+) {
+  const srcFixed = initUncanonicalizedDeviceDescriptor(src);
+  if (srcFixed) {
+    dst.requiredFeatures.push(...(srcFixed.requiredFeatures ?? []));
+    Object.assign(dst.requiredLimits, srcFixed.requiredLimits ?? {});
   }
 }
 
@@ -97,6 +144,14 @@ export class GPUTestSubcaseBatchState extends SubcaseBatchState {
   private provider: Promise<DeviceProvider> | undefined;
   /** Provider for mismatched device. */
   private mismatchedProvider: Promise<DeviceProvider> | undefined;
+  /** The accumulated skip-if requirements for this subcase */
+  private skipIfRequirements: DeviceDescriptorSimplified = {
+    requiredFeatures: [],
+    requiredLimits: {},
+    defaultQueue: {},
+  };
+  /** Whether or not to provide a mismatched device */
+  private useMismatchedDevice = false;
 
   override async postInit(): Promise<void> {
     // Skip all subcases if there's no device.
@@ -109,25 +164,22 @@ export class GPUTestSubcaseBatchState extends SubcaseBatchState {
     // Ensure devicePool.release is called for both providers even if one rejects.
     await Promise.all([
       this.provider?.then(x => devicePool.release(x)),
-      this.mismatchedProvider?.then(x => devicePool.release(x)),
+      this.mismatchedProvider?.then(x => mismatchedDevicePool.release(x)),
     ]);
   }
 
   /** @internal MAINTENANCE_TODO: Make this not visible to test code? */
   acquireProvider(): Promise<DeviceProvider> {
     if (this.provider === undefined) {
-      this.selectDeviceOrSkipTestCase(undefined);
+      this.requestDeviceWithRequiredParametersOrSkip(this.skipIfRequirements);
     }
     assert(this.provider !== undefined);
+    assert(!this.useMismatchedDevice || this.mismatchedProvider !== undefined);
     return this.provider;
   }
 
   get isCompatibility() {
     return globalTestConfig.compatibility;
-  }
-
-  getDefaultLimits() {
-    return getDefaultLimits(this.isCompatibility ? 'compatibility' : 'core');
   }
 
   /**
@@ -137,14 +189,49 @@ export class GPUTestSubcaseBatchState extends SubcaseBatchState {
    *
    * If the request isn't supported, throws a SkipTestCase exception to skip the entire test case.
    */
-  selectDeviceOrSkipTestCase(descriptor: DeviceSelectionDescriptor): void {
+  requestDeviceWithRequiredParametersOrSkip(
+    descriptor: DeviceSelectionDescriptor,
+    descriptorModifier?: DescriptorModifier
+  ): void {
     assert(this.provider === undefined, "Can't selectDeviceOrSkipTestCase() multiple times");
     this.provider = devicePool.acquire(
       this.recorder,
-      initUncanonicalizedDeviceDescriptor(descriptor)
+      initUncanonicalizedDeviceDescriptor(descriptor),
+      descriptorModifier
     );
     // Suppress uncaught promise rejection (we'll catch it later).
     this.provider.catch(() => {});
+
+    if (this.useMismatchedDevice) {
+      this.mismatchedProvider = mismatchedDevicePool.acquire(
+        this.recorder,
+        initUncanonicalizedDeviceDescriptor(descriptor),
+        descriptorModifier
+      );
+      // Suppress uncaught promise rejection (we'll catch it later).
+      this.mismatchedProvider.catch(() => {});
+    }
+  }
+
+  /**
+   * Some tests need a second device which is different from the first.
+   * This requests a second device so it will be available during the test. If it is not called,
+   * no second device will be available. The second device will be created with the
+   * same features and limits as the first device.
+   */
+  usesMismatchedDevice() {
+    assert(this.provider === undefined, 'Can not call usedMismatchedDevice after device creation');
+    this.useMismatchedDevice = true;
+  }
+
+  /**
+   * Some tests or cases need particular feature flags or limits to be enabled.
+   * Call this function with a descriptor or feature name (or `undefined`) to add
+   * features or limits required by the subcase. If the features or limits are not
+   * available a SkipTestCase exception will be thrown to skip the entire test case.
+   */
+  selectDeviceOrSkipTestCase(descriptor: DeviceSelectionDescriptor): void {
+    mergeDeviceSelectionDescriptorIntoDeviceDescriptor(descriptor, this.skipIfRequirements);
   }
 
   /**
@@ -161,8 +248,7 @@ export class GPUTestSubcaseBatchState extends SubcaseBatchState {
     const features = new Set<GPUFeatureName | undefined>();
     for (const format of formats) {
       if (format !== undefined) {
-        this.skipIfTextureFormatNotSupported(format);
-        features.add(kTextureFormatInfo[format].feature);
+        features.add(getRequiredFeatureForTextureFormat(format));
       }
     }
 
@@ -187,88 +273,11 @@ export class GPUTestSubcaseBatchState extends SubcaseBatchState {
     return this.mismatchedProvider;
   }
 
-  /**
-   * Some tests need a second device which is different from the first.
-   * This requests a second device so it will be available during the test. If it is not called,
-   * no second device will be available.
-   *
-   * If the request isn't supported, throws a SkipTestCase exception to skip the entire test case.
-   */
-  selectMismatchedDeviceOrSkipTestCase(descriptor: DeviceSelectionDescriptor): void {
-    assert(
-      this.mismatchedProvider === undefined,
-      "Can't selectMismatchedDeviceOrSkipTestCase() multiple times"
-    );
-
-    this.mismatchedProvider = mismatchedDevicePool.acquire(
-      this.recorder,
-      initUncanonicalizedDeviceDescriptor(descriptor)
-    );
-    // Suppress uncaught promise rejection (we'll catch it later).
-    this.mismatchedProvider.catch(() => {});
-  }
-
-  /** Throws an exception marking the subcase as skipped. */
-  skip(msg: string): never {
-    throw new SkipTestCase(msg);
-  }
-
-  /** Throws an exception making the subcase as skipped if condition is true */
-  skipIf(cond: boolean, msg: string | (() => string) = '') {
-    if (cond) {
-      this.skip(typeof msg === 'function' ? msg() : msg);
-    }
-  }
-
-  /**
-   * Skips test if any format is not supported.
-   */
-  skipIfTextureFormatNotSupported(...formats: (GPUTextureFormat | undefined)[]) {
-    if (this.isCompatibility) {
-      for (const format of formats) {
-        if (format === 'bgra8unorm-srgb') {
-          this.skip(`texture format '${format} is not supported`);
-        }
-      }
-    }
-  }
-
   skipIfCopyTextureToTextureNotSupportedForFormat(...formats: (GPUTextureFormat | undefined)[]) {
     if (this.isCompatibility) {
       for (const format of formats) {
         if (format && isCompressedTextureFormat(format)) {
-          this.skip(`copyTextureToTexture with ${format} is not supported`);
-        }
-      }
-    }
-  }
-
-  skipIfTextureViewDimensionNotSupported(...dimensions: (GPUTextureViewDimension | undefined)[]) {
-    if (this.isCompatibility) {
-      for (const dimension of dimensions) {
-        if (dimension === 'cube-array') {
-          this.skip(`texture view dimension '${dimension}' is not supported`);
-        }
-      }
-    }
-  }
-
-  skipIfTextureFormatNotUsableAsStorageTexture(...formats: (GPUTextureFormat | undefined)[]) {
-    for (const format of formats) {
-      if (format && !isTextureFormatUsableAsStorageFormat(format, this.isCompatibility)) {
-        this.skip(`Texture with ${format} is not usable as a storage texture`);
-      }
-    }
-  }
-
-  skipIfTextureLoadNotSupportedForTextureType(...types: (string | undefined | null)[]) {
-    if (this.isCompatibility) {
-      for (const type of types) {
-        switch (type) {
-          case 'texture_depth_2d':
-          case 'texture_depth_2d_array':
-          case 'texture_depth_multisampled_2d':
-            this.skip(`${type} is not supported by textureLoad in compatibility mode`);
+          this.skip(`copyTextureToTexture with ${format} is not supported in compatibility mode`);
         }
       }
     }
@@ -350,16 +359,8 @@ export class GPUTestBase extends Fixture<GPUTestSubcaseBatchState> {
     return globalTestConfig.compatibility;
   }
 
-  getDefaultLimits() {
-    return getDefaultLimits(this.isCompatibility ? 'compatibility' : 'core');
-  }
-
-  getDefaultLimit(limit: (typeof kLimits)[number]) {
-    return this.getDefaultLimits()[limit].default;
-  }
-
   makeLimitVariant(limit: (typeof kLimits)[number], variant: ValueTestVariant) {
-    return makeValueTestVariant(this.device.limits[limit], variant);
+    return makeValueTestVariant(this.device.limits[limit]!, variant);
   }
 
   canCallCopyTextureToBufferWithTextureFormat(format: GPUTextureFormat) {
@@ -372,11 +373,12 @@ export class GPUTestBase extends Fixture<GPUTestSubcaseBatchState> {
     assert(size % 4 === 0);
 
     const dst = this.createBufferTracked({
+      label: 'createCopyForMapRead',
       size,
       usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
     });
 
-    const c = this.device.createCommandEncoder();
+    const c = this.device.createCommandEncoder({ label: 'createCopyForMapRead' });
     c.copyBufferToBuffer(src, srcOffset, dst, 0, size);
     this.queue.submit([c.finish()]);
 
@@ -461,20 +463,64 @@ export class GPUTestBase extends Fixture<GPUTestSubcaseBatchState> {
   }
 
   /**
+   * Skips test if device does not have feature.
+   * Note: Try to use one of the more specific skipIf tests if possible.
+   */
+  skipIfDeviceDoesNotHaveFeature(feature: GPUFeatureName) {
+    this.skipIf(!this.device.features.has(feature), `device does not have feature: '${feature}'`);
+  }
+
+  /**
+   * Skips test if device des not support query type.
+   */
+  skipIfDeviceDoesNotSupportQueryType(...types: GPUQueryType[]) {
+    for (const type of types) {
+      const feature = kQueryTypeInfo[type].feature;
+      if (feature) {
+        this.skipIfDeviceDoesNotHaveFeature(feature);
+      }
+    }
+  }
+
+  skipIfDepthTextureCanNotBeUsedWithNonComparisonSampler() {
+    this.skipIf(
+      this.isCompatibility,
+      'depth textures are not usable with non-comparison samplers in compatibility mode'
+    );
+  }
+
+  /**
    * Skips test if any format is not supported.
    */
   skipIfTextureFormatNotSupported(...formats: (GPUTextureFormat | undefined)[]) {
-    if (this.isCompatibility) {
-      for (const format of formats) {
-        if (format === 'bgra8unorm-srgb') {
-          this.skip(`texture format '${format} is not supported`);
+    for (const format of formats) {
+      if (!format) {
+        continue;
+      }
+      if (format === 'bgra8unorm-srgb') {
+        if (isCompatibilityDevice(this.device)) {
+          this.skip(`texture format '${format}' is not supported`);
         }
+      }
+      const feature = getRequiredFeatureForTextureFormat(format);
+      this.skipIf(
+        !!feature && !this.device.features.has(feature),
+        `texture format '${format}' requires feature: '${feature}`
+      );
+    }
+  }
+
+  skipIfTextureFormatNotResolvable(...formats: (GPUTextureFormat | undefined)[]) {
+    for (const format of formats) {
+      if (format === undefined) continue;
+      if (!isTextureFormatResolvable(this.device, format)) {
+        this.skip(`texture format '${format}' is not resolvable`);
       }
     }
   }
 
   skipIfTextureViewDimensionNotSupported(...dimensions: (GPUTextureViewDimension | undefined)[]) {
-    if (this.isCompatibility) {
+    if (isCompatibilityDevice(this.device)) {
       for (const dimension of dimensions) {
         if (dimension === 'cube-array') {
           this.skip(`texture view dimension '${dimension}' is not supported`);
@@ -484,7 +530,7 @@ export class GPUTestBase extends Fixture<GPUTestSubcaseBatchState> {
   }
 
   skipIfCopyTextureToTextureNotSupportedForFormat(...formats: (GPUTextureFormat | undefined)[]) {
-    if (this.isCompatibility) {
+    if (isCompatibilityDevice(this.device)) {
       for (const format of formats) {
         if (format && isCompressedTextureFormat(format)) {
           this.skip(`copyTextureToTexture with ${format} is not supported`);
@@ -493,10 +539,93 @@ export class GPUTestBase extends Fixture<GPUTestSubcaseBatchState> {
     }
   }
 
+  skipIfTextureLoadNotSupportedForTextureType(...types: (string | undefined | null)[]) {
+    if (this.isCompatibility) {
+      for (const type of types) {
+        switch (type) {
+          case 'texture_depth_2d':
+          case 'texture_depth_2d_array':
+          case 'texture_depth_multisampled_2d':
+            this.skip(`${type} is not supported by textureLoad in compatibility mode`);
+        }
+      }
+    }
+  }
+
   skipIfTextureFormatNotUsableAsStorageTexture(...formats: (GPUTextureFormat | undefined)[]) {
     for (const format of formats) {
-      if (format && !isTextureFormatUsableAsStorageFormat(format, this.isCompatibility)) {
+      if (format && !isTextureFormatUsableAsStorageFormat(this.device, format)) {
         this.skip(`Texture with ${format} is not usable as a storage texture`);
+      }
+    }
+  }
+
+  skipIfTextureFormatNotUsableAsReadWriteStorageTexture(
+    ...formats: (GPUTextureFormat | undefined)[]
+  ) {
+    for (const format of formats) {
+      if (!format) continue;
+
+      if (!isTextureFormatUsableAsReadWriteStorageTexture(this.device, format)) {
+        this.skip(`Texture with ${format} is not usable as a storage texture`);
+      }
+    }
+  }
+
+  skipIfTextureFormatNotUsableAsRenderAttachment(...formats: (GPUTextureFormat | undefined)[]) {
+    for (const format of formats) {
+      if (format && !isTextureFormatUsableAsRenderAttachment(this.device, format)) {
+        this.skip(`Texture with ${format} is not usable as a render attachment`);
+      }
+    }
+  }
+
+  skipIfTextureFormatNotMultisampled(...formats: (GPUTextureFormat | undefined)[]) {
+    for (const format of formats) {
+      if (format === undefined) continue;
+      if (!isTextureFormatMultisampled(this.device, format)) {
+        this.skip(`texture format '${format}' does not support multisampling`);
+      }
+    }
+  }
+
+  skipIfTextureFormatNotBlendable(...formats: (GPUTextureFormat | undefined)[]) {
+    for (const format of formats) {
+      if (format === undefined) continue;
+      this.skipIf(isSintOrUintFormat(format), 'sint/uint formats are not blendable');
+      if (is32Float(format)) {
+        this.skipIf(
+          !this.device.features.has('float32-blendable'),
+          `texture format '${format}' is not blendable`
+        );
+      }
+    }
+  }
+
+  skipIfTextureFormatNotFilterable(...formats: (GPUTextureFormat | undefined)[]) {
+    for (const format of formats) {
+      if (format === undefined) continue;
+      this.skipIf(isSintOrUintFormat(format), 'sint/uint formats are not filterable');
+      if (is32Float(format)) {
+        this.skipIf(
+          !this.device.features.has('float32-filterable'),
+          `texture format '${format}' is not filterable`
+        );
+      }
+    }
+  }
+
+  skipIfTextureFormatDoesNotSupportUsage(
+    usage: GPUTextureUsageFlags,
+    ...formats: (GPUTextureFormat | undefined)[]
+  ) {
+    for (const format of formats) {
+      if (!format) continue;
+      if (usage & GPUTextureUsage.RENDER_ATTACHMENT) {
+        this.skipIfTextureFormatNotUsableAsRenderAttachment(format);
+      }
+      if (usage & GPUTextureUsage.STORAGE_BINDING) {
+        this.skipIfTextureFormatNotUsableAsStorageTexture(format);
       }
     }
   }
@@ -515,7 +644,7 @@ export class GPUTestBase extends Fixture<GPUTestSubcaseBatchState> {
     }
   }
 
-  /** returns true iff the `langFeature` is supported  */
+  /** returns true if the `langFeature` is supported  */
   hasLanguageFeature(langFeature: WGSLLanguageFeature) {
     const lf = getGPU(this.rec).wgslLanguageFeatures;
     return lf !== undefined && lf.has(langFeature);
@@ -615,6 +744,7 @@ export class GPUTestBase extends Fixture<GPUTestSubcaseBatchState> {
 
     // Copy into a buffer suitable for STORAGE usage.
     const storageBuffer = this.createBufferTracked({
+      label: 'expectGPUBufferRepeatsSingleValue:storageBuffer',
       size: bufferSize,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
@@ -626,6 +756,7 @@ export class GPUTestBase extends Fixture<GPUTestSubcaseBatchState> {
     // `expectedValue` as-is.
     const expectedDataSize = Math.max(4, valueSize);
     const expectedDataBuffer = this.createBufferTracked({
+      label: 'expectGPUBufferRepeatsSingleValue:expectedDataBuffer',
       size: expectedDataSize,
       usage: GPUBufferUsage.STORAGE,
       mappedAtCreation: true,
@@ -649,6 +780,7 @@ export class GPUTestBase extends Fixture<GPUTestSubcaseBatchState> {
     // The output buffer has one 32-bit entry per buffer row. An entry's value will be 1 if every
     // read from the corresponding row matches the expected data derived above, or 0 otherwise.
     const resultBuffer = this.createBufferTracked({
+      label: 'expectGPUBufferRepeatsSingleValue:resultBuffer',
       size: numRows * 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
     });
@@ -693,7 +825,9 @@ export class GPUTestBase extends Fixture<GPUTestSubcaseBatchState> {
       ],
     });
 
-    const commandEncoder = this.device.createCommandEncoder();
+    const commandEncoder = this.device.createCommandEncoder({
+      label: 'expectGPUBufferRepeatsSingleValue',
+    });
     commandEncoder.copyBufferToBuffer(buffer, 0, storageBuffer, 0, bufferSize);
     const pass = commandEncoder.beginComputePass();
     pass.setPipeline(pipeline);
@@ -755,11 +889,12 @@ export class GPUTestBase extends Fixture<GPUTestSubcaseBatchState> {
     const expectedTexelData = rep.pack(rep.encode(exp));
 
     const buffer = this.createBufferTracked({
+      label: 'expectSingleColor',
       size: byteLength,
       usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
 
-    const commandEncoder = this.device.createCommandEncoder();
+    const commandEncoder = this.device.createCommandEncoder({ label: 'expectSingleColor' });
     commandEncoder.copyTextureToBuffer(
       {
         texture: src,
@@ -796,11 +931,14 @@ export class GPUTestBase extends Fixture<GPUTestSubcaseBatchState> {
       layout
     );
     const buffer = this.createBufferTracked({
+      label: 'readSinglePixelFrom2DTexture',
       size: byteLength,
       usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
 
-    const commandEncoder = this.device.createCommandEncoder();
+    const commandEncoder = this.device.createCommandEncoder({
+      label: 'readSinglePixelFrom2DTexture',
+    });
     commandEncoder.copyTextureToBuffer(
       { texture: src, mipLevel: layout?.mipLevel, origin: { x, y, z: slice } },
       { buffer, bytesPerRow, rowsPerImage },
@@ -926,6 +1064,7 @@ export class GPUTestBase extends Fixture<GPUTestSubcaseBatchState> {
     });
 
     const storageBuffer = this.createBufferTracked({
+      label: 'copy2DTextureToBufferUsingComputePass:storageBuffer',
       size: sampleCount * type.size * componentCount * width * height,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     });
@@ -957,7 +1096,9 @@ export class GPUTestBase extends Fixture<GPUTestSubcaseBatchState> {
       ],
     });
 
-    const encoder = this.device.createCommandEncoder();
+    const encoder = this.device.createCommandEncoder({
+      label: 'copy2DTextureToBufferUsingComputePass',
+    });
     const pass = encoder.beginComputePass();
     pass.setPipeline(computePipeline);
     pass.setBindGroup(0, uniformBindGroup);
@@ -1118,9 +1259,11 @@ export class GPUTestBase extends Fixture<GPUTestSubcaseBatchState> {
     {
       attachmentInfo,
       occlusionQuerySet,
+      targets,
     }: {
       attachmentInfo?: GPURenderBundleEncoderDescriptor;
       occlusionQuerySet?: GPUQuerySet;
+      targets?: GPUTextureView[];
     } = {}
   ): CommandBufferMaker<T> {
     const fullAttachmentInfo = {
@@ -1142,7 +1285,7 @@ export class GPUTestBase extends Fixture<GPUTestSubcaseBatchState> {
       case 'render bundle': {
         const device = this.device;
         const rbEncoder = device.createRenderBundleEncoder(fullAttachmentInfo);
-        const pass = this.createEncoder('render pass', { attachmentInfo });
+        const pass = this.createEncoder('render pass', { attachmentInfo, targets });
 
         return new CommandBufferMaker(this, rbEncoder, () => {
           pass.encoder.executeBundles([rbEncoder.finish()]);
@@ -1175,7 +1318,7 @@ export class GPUTestBase extends Fixture<GPUTestSubcaseBatchState> {
             stencilReadOnly: fullAttachmentInfo.stencilReadOnly,
           };
           if (
-            kTextureFormatInfo[fullAttachmentInfo.depthStencilFormat].depth &&
+            isDepthTextureFormat(fullAttachmentInfo.depthStencilFormat) &&
             !fullAttachmentInfo.depthReadOnly
           ) {
             depthStencilAttachment.depthClearValue = 0;
@@ -1183,7 +1326,7 @@ export class GPUTestBase extends Fixture<GPUTestSubcaseBatchState> {
             depthStencilAttachment.depthStoreOp = 'discard';
           }
           if (
-            kTextureFormatInfo[fullAttachmentInfo.depthStencilFormat].stencil &&
+            isStencilTextureFormat(fullAttachmentInfo.depthStencilFormat) &&
             !fullAttachmentInfo.stencilReadOnly
           ) {
             depthStencilAttachment.stencilClearValue = 1;
@@ -1192,10 +1335,10 @@ export class GPUTestBase extends Fixture<GPUTestSubcaseBatchState> {
           }
         }
         const passDesc: GPURenderPassDescriptor = {
-          colorAttachments: Array.from(fullAttachmentInfo.colorFormats, format =>
+          colorAttachments: Array.from(fullAttachmentInfo.colorFormats, (format, i) =>
             format
               ? {
-                  view: makeAttachmentView(format),
+                  view: targets ? targets[i] : makeAttachmentView(format),
                   clearValue: [0, 0, 0, 0],
                   loadOp: 'clear',
                   storeOp: 'store',
@@ -1254,7 +1397,7 @@ export class GPUTest extends GPUTestBase {
   get mismatchedDevice(): GPUDevice {
     assert(
       this.mismatchedProvider !== undefined,
-      'selectMismatchedDeviceOrSkipTestCase was not called in beforeAllSubcases'
+      'usesMismatchedDevice or selectMismatchedDeviceOrSkipTestCase was not called in beforeAllSubcases'
     );
     return this.mismatchedProvider.device;
   }
@@ -1265,6 +1408,293 @@ export class GPUTest extends GPUTestBase {
   expectDeviceLost(reason: GPUDeviceLostReason): void {
     assert(this.provider !== undefined, 'internal error: GPUDevice missing?');
     this.provider.expectDeviceLost(reason);
+  }
+}
+
+/**
+ * Gets the adapter limits as a standard JavaScript object.
+ */
+function getAdapterLimitsAsDeviceRequiredLimits(adapter: GPUAdapter) {
+  const requiredLimits: Record<string, GPUSize64> = {};
+  const adapterLimits = adapter.limits as unknown as Record<string, GPUSize64>;
+  for (const key in adapter.limits) {
+    // MAINTENANCE_TODO: Remove this once minSubgroupSize is removed from
+    // chromium.
+    if (key === 'maxSubgroupSize' || key === 'minSubgroupSize') {
+      continue;
+    }
+    requiredLimits[key] = adapterLimits[key];
+  }
+  return requiredLimits;
+}
+
+/**
+ * Removes limits that don't exist on the adapter.
+ * A test might request a new limit that not all implementations support. The test itself
+ * should check the requested limit using code that expects undefined.
+ *
+ * ```ts
+ *    t.skipIf(limit < 2);     // BAD! Doesn't skip if unsupported because undefined is never less than 2.
+ *    t.skipIf(!(limit >= 2)); // Good. Skips if limits is not >= 2. undefined is not >= 2.
+ * ```
+ */
+function removeNonExistentLimits(adapter: GPUAdapter, limits: Record<string, GPUSize64>) {
+  const filteredLimits: Record<string, GPUSize64> = {};
+  const adapterLimits = adapter.limits as unknown as Record<string, GPUSize64>;
+  for (const [limit, value] of Object.entries(limits)) {
+    if (adapterLimits[limit] !== undefined) {
+      filteredLimits[limit] = value;
+    }
+  }
+  return filteredLimits;
+}
+
+function applyLimitsToDescriptor(
+  adapter: GPUAdapter,
+  desc: CanonicalDeviceDescriptor | undefined,
+  getRequiredLimits: (adapter: GPUAdapter) => Record<string, number>
+) {
+  const descWithMaxLimits: CanonicalDeviceDescriptor = {
+    requiredFeatures: [],
+    defaultQueue: {},
+    ...desc,
+    requiredLimits: removeNonExistentLimits(adapter, getRequiredLimits(adapter)),
+  };
+  return descWithMaxLimits;
+}
+
+function getAdapterFeaturesAsDeviceRequiredFeatures(adapter: GPUAdapter): Iterable<GPUFeatureName> {
+  return [...adapter.features].filter(
+    f => f !== 'core-features-and-limits'
+  ) as Iterable<GPUFeatureName>;
+}
+
+function applyFeaturesToDescriptor(
+  adapter: GPUAdapter,
+  desc: CanonicalDeviceDescriptor | undefined,
+  getRequiredFeatures: (adapter: GPUAdapter) => Iterable<GPUFeatureName>
+) {
+  const existingRequiredFeatures = (desc && desc?.requiredFeatures) ?? [];
+  const descWithRequiredFeatures: CanonicalDeviceDescriptor = {
+    requiredLimits: {},
+    defaultQueue: {},
+    ...desc,
+    requiredFeatures: [...existingRequiredFeatures, ...getRequiredFeatures(adapter)],
+  };
+  return descWithRequiredFeatures;
+}
+
+/**
+ * Used by RequiredLimitsTestMixin to allow you to request specific limits
+ *
+ * Supply a `getRequiredLimits` function that given a GPUAdapter, turns the limits
+ * you want.
+ *
+ * Also supply a key function that returns a device key. You should generally return
+ * the name of each limit you request and any math you did on the limit. For example
+ *
+ * ```js
+ * {
+ *   getRequiredLimits(adapter) {
+ *     return {
+ *       maxBindGroups: adapter.limits.maxBindGroups / 2,
+ *       maxTextureDimensions2D: Math.max(adapter.limits.maxTextureDimensions2D, 8192),
+ *     },
+ *   },
+ *   key() {
+ *     return `
+ *       maxBindGroups / 2,
+ *       max(maxTextureDimension2D, 8192),
+ *     `;
+ *   },
+ * }
+ * ```
+ *
+ * Its important to note, the key is used BEFORE knowing the adapter limits to get a device
+ * that was already created with the same key.
+ */
+interface RequiredLimitsHelper {
+  getRequiredLimits: (adapter: GPUAdapter) => Record<string, number>;
+  key(): string;
+}
+
+/**
+ * Used by RequiredLimitsTest to request a device with all requested limits of the adapter.
+ */
+export class RequiredLimitsGPUTestSubcaseBatchState extends GPUTestSubcaseBatchState {
+  private requiredLimitsHelper: RequiredLimitsHelper;
+  constructor(
+    protected override readonly recorder: TestCaseRecorder,
+    public override readonly params: TestParams,
+    requiredLimitsHelper: RequiredLimitsHelper
+  ) {
+    super(recorder, params);
+    this.requiredLimitsHelper = requiredLimitsHelper;
+  }
+  override requestDeviceWithRequiredParametersOrSkip(
+    descriptor: DeviceSelectionDescriptor,
+    descriptorModifier?: DescriptorModifier
+  ): void {
+    const requiredLimitsHelper = this.requiredLimitsHelper;
+    const mod: DescriptorModifier = {
+      descriptorModifier(adapter: GPUAdapter, desc: CanonicalDeviceDescriptor | undefined) {
+        desc = descriptorModifier?.descriptorModifier
+          ? descriptorModifier.descriptorModifier(adapter, desc)
+          : desc;
+        return applyLimitsToDescriptor(adapter, desc, requiredLimitsHelper.getRequiredLimits);
+      },
+      keyModifier(baseKey: string) {
+        return `${baseKey}:${requiredLimitsHelper.key()}`;
+      },
+    };
+    super.requestDeviceWithRequiredParametersOrSkip(
+      initUncanonicalizedDeviceDescriptor(descriptor),
+      mod
+    );
+  }
+}
+
+export type RequiredLimitsTestMixinType = {
+  // placeholder. Change to an interface if we need MaxLimits specific methods.
+};
+
+/**
+ * A text mixin to make it relatively easy to request specific limits.
+ */
+export function RequiredLimitsTestMixin<F extends FixtureClass<GPUTestBase>>(
+  Base: F,
+  requiredLimitsHelper: RequiredLimitsHelper
+): FixtureClassWithMixin<F, RequiredLimitsTestMixinType> {
+  class RequiredLimitsImpl
+    extends (Base as FixtureClassInterface<GPUTestBase>)
+    implements RequiredLimitsTestMixinType
+  {
+    //
+    public static override MakeSharedState(
+      recorder: TestCaseRecorder,
+      params: TestParams
+    ): GPUTestSubcaseBatchState {
+      return new RequiredLimitsGPUTestSubcaseBatchState(recorder, params, requiredLimitsHelper);
+    }
+  }
+
+  return RequiredLimitsImpl as unknown as FixtureClassWithMixin<F, RequiredLimitsTestMixinType>;
+}
+
+/**
+ * Requests all the max limits from the adapter.
+ * @deprecated Use AllFeaturesMaxLimitsGPUTest or related.
+ */
+export function MaxLimitsTestMixin<F extends FixtureClass<GPUTestBase>>(Base: F) {
+  return RequiredLimitsTestMixin(Base, {
+    getRequiredLimits: getAdapterLimitsAsDeviceRequiredLimits,
+    key() {
+      return 'AllLimits';
+    },
+  });
+}
+
+/**
+ * Used by AllFeaturesMaxLimitsGPUTest to request a device with all limits and features of the adapter.
+ */
+export class AllFeaturesMaxLimitsGPUTestSubcaseBatchState extends GPUTestSubcaseBatchState {
+  constructor(
+    protected override readonly recorder: TestCaseRecorder,
+    public override readonly params: TestParams
+  ) {
+    super(recorder, params);
+  }
+  override requestDeviceWithRequiredParametersOrSkip(
+    descriptor: DeviceSelectionDescriptor,
+    descriptorModifier?: DescriptorModifier
+  ): void {
+    const mod: DescriptorModifier = {
+      descriptorModifier(adapter: GPUAdapter, desc: CanonicalDeviceDescriptor | undefined) {
+        desc = descriptorModifier?.descriptorModifier
+          ? descriptorModifier.descriptorModifier(adapter, desc)
+          : desc;
+        desc = applyLimitsToDescriptor(adapter, desc, getAdapterLimitsAsDeviceRequiredLimits);
+        desc = applyFeaturesToDescriptor(adapter, desc, getAdapterFeaturesAsDeviceRequiredFeatures);
+        return desc;
+      },
+      keyModifier(baseKey: string) {
+        return `${baseKey}:AllFeaturesMaxLimits`;
+      },
+    };
+    super.requestDeviceWithRequiredParametersOrSkip(
+      initUncanonicalizedDeviceDescriptor(descriptor),
+      mod
+    );
+  }
+
+  /**
+   * Use skipIfDeviceDoesNotHaveFeature or similar. If you really need to test
+   * lack of a feature (for example tests under webgpu/api/validation/capability_checks)
+   * then use UniqueFeaturesAndLimitsGPUTest
+   */
+  override selectDeviceOrSkipTestCase(descriptor: DeviceSelectionDescriptor): void {
+    unreachable('this function should not be called in AllFeaturesMaxLimitsGPUTest');
+  }
+
+  /**
+   * Use skipIfDeviceDoesNotHaveFeature or similar.
+   */
+  override selectDeviceForQueryTypeOrSkipTestCase(types: GPUQueryType | GPUQueryType[]): void {
+    unreachable('this function should not be called in AllFeaturesMaxLimitsGPUTest');
+  }
+
+  /**
+   * Use skipIfDeviceDoesNotHaveFeature or skipIf(device.limits.maxXXX < requiredXXX) etc...
+   */
+  override selectDeviceForTextureFormatOrSkipTestCase(
+    formats: GPUTextureFormat | undefined | (GPUTextureFormat | undefined)[]
+  ): void {
+    unreachable('this function should not be called in AllFeaturesMaxLimitsGPUTest');
+  }
+
+  /**
+   * Use skipIfDeviceDoesNotHaveFeature or skipIf(device.limits.maxXXX < requiredXXX) etc...
+   */
+  selectMismatchedDeviceOrSkipTestCase(descriptor: DeviceSelectionDescriptor): void {
+    unreachable('this function should not be called in AllFeaturesMaxLimitsGPUTest');
+  }
+}
+
+/**
+ * Most tests should be using `AllFeaturesMaxLimitsGPUTest`. The exceptions
+ * are tests specifically validating limits like those under api/validation/capability_checks/limits
+ * and those tests the specifically validate certain features fail validation if not enabled
+ * like those under api/validation/capability_checks/feature.
+ *
+ * NOTE: The goal is to go through all existing tests and remove any direct use of GPUTest.
+ * For each test, choose either AllFeaturesMaxLimitsGPUTest or UniqueFeaturesOrLimitsGPUTest.
+ * This way we can track progress as we go through every test using GPUTest and check it is
+ * testing everything it should test.
+ */
+export class UniqueFeaturesOrLimitsGPUTest extends GPUTest {}
+
+/**
+ * A test that requests all features and maximum limits. This should be the default
+ * test for the majority of tests, otherwise optional features will not be tested.
+ * The exceptions are only tests that explicitly test the absence of a feature or
+ * specific limits such as the tests under validation/capability_checks.
+ *
+ * As a concrete example to demonstrate the issue, texture format `rg11b10ufloat` is
+ * optionally renderable and can optionally be used multisampled. Any test that tests
+ * texture formats should test this format, skipping only if the feature is missing.
+ * So, the default should be that the test tests `kAllTextureFormats` with the appropriate
+ * filters from format_info.ts or the various helpers. This way, `rg11b10ufloat` will
+ * included in the test and fail if not appropriately filtered. If instead you were
+ * to use GPUTest then `rg11b10ufloat` would just be skipped as its never enabled.
+ * You could enable it manually but that spreads enabling to every test instead of being
+ * centralized in one place, here.
+ */
+export class AllFeaturesMaxLimitsGPUTest extends GPUTest {
+  public static override MakeSharedState(
+    recorder: TestCaseRecorder,
+    params: TestParams
+  ): GPUTestSubcaseBatchState {
+    return new AllFeaturesMaxLimitsGPUTestSubcaseBatchState(recorder, params);
   }
 }
 
@@ -1486,11 +1916,11 @@ type LinearCopyParameters = {
   data: Uint8Array;
 };
 
-export function TextureTestMixin<F extends FixtureClass<GPUTest>>(
+export function TextureTestMixin<F extends FixtureClass<GPUTestBase>>(
   Base: F
 ): FixtureClassWithMixin<F, TextureTestMixinType> {
   class TextureExpectations
-    extends (Base as FixtureClassInterface<GPUTest>)
+    extends (Base as FixtureClassInterface<GPUTestBase>)
     implements TextureTestMixinType
   {
     /**
@@ -1645,6 +2075,7 @@ export function TextureTestMixin<F extends FixtureClass<GPUTest>>(
           const readbackPromisesPerLayer = [];
 
           const uniformBuffer = this.createBufferTracked({
+            label: 'expectTexturesToMatchByRendering:uniforBuffer',
             size: 4,
             usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
           });
@@ -1681,7 +2112,9 @@ export function TextureTestMixin<F extends FixtureClass<GPUTest>>(
 
             this.device.queue.writeBuffer(uniformBuffer, 0, new Uint32Array([layer]));
 
-            const encoder = this.device.createCommandEncoder();
+            const encoder = this.device.createCommandEncoder({
+              label: 'expectTexturesToMatchByRendering',
+            });
             const pass = encoder.beginRenderPass({
               colorAttachments: [
                 {
@@ -1753,7 +2186,9 @@ export function TextureTestMixin<F extends FixtureClass<GPUTest>>(
     }
 
     copyWholeTextureToNewBufferSimple(texture: GPUTexture, mipLevel: number) {
-      const { blockWidth, blockHeight, bytesPerBlock } = kTextureFormatInfo[texture.format];
+      const { blockWidth, blockHeight, bytesPerBlock } = getBlockInfoForTextureFormat(
+        texture.format
+      );
       const mipSize = physicalMipSizeFromTexture(texture, mipLevel);
       assert(bytesPerBlock !== undefined);
 
@@ -1788,12 +2223,13 @@ export function TextureTestMixin<F extends FixtureClass<GPUTest>>(
     ): GPUBuffer {
       const { byteLength, bytesPerRow, rowsPerImage } = resultDataLayout;
       const buffer = this.createBufferTracked({
+        label: 'copyWholeTextureToNewBuffer:buffer',
         size: align(byteLength, 4), // this is necessary because we need to copy and map data from this buffer
         usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
       });
 
       const mipSize = physicalMipSizeFromTexture(texture, mipLevel || 0);
-      const encoder = this.device.createCommandEncoder();
+      const encoder = this.device.createCommandEncoder({ label: 'copyWholeTextureToNewBuffer' });
       encoder.copyTextureToBuffer(
         { texture, mipLevel },
         { buffer, bytesPerRow, rowsPerImage },
@@ -1842,7 +2278,7 @@ export function TextureTestMixin<F extends FixtureClass<GPUTest>>(
       origin: Required<GPUOrigin3DDict> = { x: 0, y: 0, z: 0 }
     ): number {
       const { offset, bytesPerRow, rowsPerImage } = textureDataLayout;
-      const info = kTextureFormatInfo[format];
+      const info = getBlockInfoForColorTextureFormat(format);
 
       assert(texel.x % info.blockWidth === 0);
       assert(texel.y % info.blockHeight === 0);
@@ -1855,7 +2291,7 @@ export function TextureTestMixin<F extends FixtureClass<GPUTest>>(
         offset +
         (texel.z + origin.z) * bytesPerImage +
         ((texel.y + origin.y) / info.blockHeight) * bytesPerRow +
-        ((texel.x + origin.x) / info.blockWidth) * info.color.bytes
+        ((texel.x + origin.x) / info.blockWidth) * info.bytesPerBlock
       );
     }
 
@@ -1867,7 +2303,7 @@ export function TextureTestMixin<F extends FixtureClass<GPUTest>>(
         // do not iterate anything for an empty region
         return;
       }
-      const info = kTextureFormatInfo[format];
+      const info = getBlockInfoForTextureFormat(format);
       assert(size.height % info.blockHeight === 0);
       // Note: it's important that the order is in increasing memory address order.
       for (let z = 0; z < size.depthOrArrayLayers; ++z) {

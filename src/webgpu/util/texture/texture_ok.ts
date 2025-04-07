@@ -1,6 +1,11 @@
 import { assert, ErrorWithExtra, unreachable } from '../../../common/util/util.js';
-import { kTextureFormatInfo, EncodableTextureFormat } from '../../format_info.js';
-import { GPUTest } from '../../gpu_test.js';
+import {
+  EncodableTextureFormat,
+  getTextureFormatType,
+  isColorTextureFormat,
+  isDepthTextureFormat,
+} from '../../format_info.js';
+import { GPUTestBase } from '../../gpu_test.js';
 import { numbersApproximatelyEqual } from '../conversion.js';
 import { generatePrettyTable, numericToStringBuilder } from '../pretty_diff_tables.js';
 import { reifyExtent3D, reifyOrigin3D } from '../unions.js';
@@ -166,7 +171,7 @@ function comparePerComponent(
 
 /** Create a new mappable GPUBuffer, and copy a subrectangle of GPUTexture data into it. */
 function createTextureCopyForMapRead(
-  t: GPUTest,
+  t: GPUTestBase,
   source: GPUTexelCopyTextureInfo,
   copySize: GPUExtent3D,
   { format }: { format: EncodableTextureFormat }
@@ -180,7 +185,7 @@ function createTextureCopyForMapRead(
     size: byteLength,
   });
 
-  const cmd = t.device.createCommandEncoder();
+  const cmd = t.device.createCommandEncoder({ label: 'createTextureCopyForMapRead' });
   cmd.copyTextureToBuffer(source, { buffer, bytesPerRow, rowsPerImage }, copySize);
   t.device.queue.submit([cmd.finish()]);
 
@@ -220,14 +225,13 @@ export function findFailedPixels(
     return undefined;
   }
 
-  const info = kTextureFormatInfo[format];
   const repr = kTexelRepresentationInfo[format];
   // MAINTENANCE_TODO: Print depth-stencil formats as float+int instead of float+float.
-  const printAsInteger = info.color
+  const printAsInteger = isColorTextureFormat(format)
     ? // For color, pick the type based on the format type
-      ['uint', 'sint'].includes(info.color.type)
+      ['uint', 'sint'].includes(getTextureFormatType(format))
     : // Print depth as "float", depth-stencil as "float,float", stencil as "int".
-      !info.depth;
+      !isDepthTextureFormat(format);
   const numericToString = numericToStringBuilder(printAsInteger);
 
   const componentOrderStr = repr.componentOrder.join(',') + ':';
@@ -297,7 +301,7 @@ ${generatePrettyTable(opts, [
  * subnormal numbers (where ULP is defined for float, normalized, and integer formats).
  */
 export async function textureContentIsOKByT2B(
-  t: GPUTest,
+  t: GPUTestBase,
   source: GPUTexelCopyTextureInfo,
   copySize_: GPUExtent3D,
   { expTexelView }: { expTexelView: TexelView },

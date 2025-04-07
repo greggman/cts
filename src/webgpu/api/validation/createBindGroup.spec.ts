@@ -8,6 +8,7 @@ import { makeTestGroup } from '../../../common/framework/test_group.js';
 import { assert, makeValueTestVariant, unreachable } from '../../../common/util/util.js';
 import {
   allBindingEntries,
+  BGLEntry,
   BindableResource,
   bindingTypeInfo,
   bufferBindingEntries,
@@ -23,19 +24,52 @@ import {
   texBindingTypeInfo,
 } from '../../capability_info.js';
 import { GPUConst } from '../../constants.js';
-import { kAllTextureFormats, kTextureFormatInfo } from '../../format_info.js';
+import { kPossibleStorageTextureFormats, kRegularTextureFormats } from '../../format_info.js';
 import { kResourceStates } from '../../gpu_test.js';
 import { getTextureDimensionFromView } from '../../util/texture/base.js';
 
-import { ValidationTest } from './validation_test.js';
+import { AllFeaturesMaxLimitsValidationTest } from './validation_test.js';
+
+const kTestFormat: GPUTextureFormat = 'r32float';
 
 function clone<T extends GPUTextureDescriptor>(descriptor: T): T {
   return JSON.parse(JSON.stringify(descriptor));
 }
 
-export const g = makeTestGroup(ValidationTest);
+function skipIfResourceNotSupportedInStages(
+  t: AllFeaturesMaxLimitsValidationTest,
+  entry: BGLEntry,
+  visibility: number
+) {
+  if (t.isCompatibility) {
+    t.skipIf(
+      (visibility & GPUShaderStage.FRAGMENT) !== 0 &&
+        (entry.buffer?.type === 'storage' || entry.buffer?.type === 'read-only-storage') &&
+        !(t.device.limits.maxStorageBuffersInFragmentStage! >= 2),
+      `maxStorageBuffersInFragmentStage(${t.device.limits.maxStorageBuffersInFragmentStage}) < 2`
+    );
+    t.skipIf(
+      (visibility & GPUShaderStage.FRAGMENT) !== 0 &&
+        entry.storageTexture !== undefined &&
+        !(t.device.limits.maxStorageTexturesInFragmentStage! >= 1),
+      `maxStorageTexturesInFragmentStage(${t.device.limits.maxStorageTexturesInFragmentStage}) < 1`
+    );
+    t.skipIf(
+      (visibility & GPUShaderStage.VERTEX) !== 0 &&
+        (entry.buffer?.type === 'storage' || entry.buffer?.type === 'read-only-storage') &&
+        !(t.device.limits.maxStorageBuffersInVertexStage! >= 2),
+      `maxStorageBuffersInVertexStage(${t.device.limits.maxStorageBuffersInVertexStage}) < 2`
+    );
+    t.skipIf(
+      (visibility & GPUShaderStage.VERTEX) !== 0 &&
+        entry.storageTexture !== undefined &&
+        !(t.device.limits.maxStorageTexturesInVertexStage! >= 1),
+      `maxStorageTexturesInVertexStage(${t.device.limits.maxStorageTexturesInVertexStage}) < 1`
+    );
+  }
+}
 
-const kStorageTextureFormats = kAllTextureFormats.filter(f => kTextureFormatInfo[f].color?.storage);
+export const g = makeTestGroup(AllFeaturesMaxLimitsValidationTest);
 
 g.test('binding_count_mismatch')
   .desc('Test that the number of entries must match the number of entries in the BindGroupLayout.')
@@ -110,7 +144,7 @@ g.test('binding_must_contain_resource_defined_in_layout')
   .params(u =>
     u //
       .combine('resourceType', kBindableResources)
-      .combine('entry', allBindingEntries(false))
+      .combine('entry', allBindingEntries(false, kTestFormat))
   )
   .fn(t => {
     const { resourceType, entry } = t.params;
@@ -161,7 +195,7 @@ g.test('texture_binding_must_have_correct_usage')
   .desc('Tests that texture bindings must have the correct usage.')
   .paramsSubcasesOnly(u =>
     u //
-      .combine('entry', sampledAndStorageBindingEntries(false))
+      .combine('entry', sampledAndStorageBindingEntries(false, kTestFormat))
       .combine('usage', kTextureUsages)
       .unless(({ entry, usage }) => {
         const info = texBindingTypeInfo(entry);
@@ -173,8 +207,13 @@ g.test('texture_binding_must_have_correct_usage')
     const { entry, usage } = t.params;
     const info = texBindingTypeInfo(entry);
 
+    t.skipIf(
+      t.isCompatibility && info.resource === 'sampledTexMS',
+      "The test requires 'r32float' multisampled support which compat mode doesn't guarantee."
+    );
+
     const bindGroupLayout = t.device.createBindGroupLayout({
-      entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, ...entry }],
+      entries: [{ binding: 0, visibility: GPUShaderStage.COMPUTE, ...entry }],
     });
 
     // The `RENDER_ATTACHMENT` usage must be specified if sampleCount > 1 according to WebGPU SPEC.
@@ -183,7 +222,7 @@ g.test('texture_binding_must_have_correct_usage')
 
     const descriptor = {
       size: { width: 16, height: 16, depthOrArrayLayers: 1 },
-      format: 'r32float' as const,
+      format: kTestFormat,
       usage: appliedUsage,
       sampleCount: info.resource === 'sampledTexMS' ? 4 : 1,
     };
@@ -304,12 +343,12 @@ g.test('texture_must_have_correct_dimension')
         usage === GPUTextureUsage.TEXTURE_BINDING
           ? {
               binding: 0,
-              visibility: GPUShaderStage.FRAGMENT,
+              visibility: GPUShaderStage.COMPUTE,
               texture: { viewDimension },
             }
           : {
               binding: 0,
-              visibility: GPUShaderStage.FRAGMENT,
+              visibility: GPUShaderStage.COMPUTE,
               storageTexture: { access: 'write-only', format: 'rgba8unorm', viewDimension },
             },
       ],
@@ -374,7 +413,7 @@ g.test('multisampled_validation')
       entries: [
         {
           binding: 0,
-          visibility: GPUShaderStage.FRAGMENT,
+          visibility: GPUShaderStage.COMPUTE,
           texture: { multisampled, sampleType: multisampled ? 'unfilterable-float' : undefined },
         },
       ],
@@ -482,7 +521,7 @@ g.test('minBindingSize')
       entries: [
         {
           binding: 0,
-          visibility: GPUShaderStage.FRAGMENT,
+          visibility: GPUShaderStage.COMPUTE,
           buffer: {
             type: 'storage',
             minBindingSize,
@@ -512,23 +551,32 @@ g.test('minBindingSize')
     );
   });
 
+const kAllShaderStages =
+  GPUConst.ShaderStage.COMPUTE | GPUConst.ShaderStage.FRAGMENT | GPUConst.ShaderStage.VERTEX;
+
 g.test('buffer,resource_state')
   .desc('Test bind group creation with various buffer resource states')
   .paramsSubcasesOnly(u =>
-    u.combine('state', kResourceStates).combine('entry', bufferBindingEntries(true))
+    u
+      .combine('state', kResourceStates)
+      .combine('entry', bufferBindingEntries(true))
+      .combine('visibilityMask', [kAllShaderStages, GPUConst.ShaderStage.COMPUTE] as const)
   )
   .fn(t => {
-    const { state, entry } = t.params;
+    const { state, entry, visibilityMask } = t.params;
 
     assert(entry.buffer !== undefined);
     const info = bufferBindingTypeInfo(entry.buffer);
+
+    const visibility = info.validStages & visibilityMask;
+    skipIfResourceNotSupportedInStages(t, entry, visibility);
 
     const bgl = t.device.createBindGroupLayout({
       entries: [
         {
           ...entry,
           binding: 0,
-          visibility: info.validStages,
+          visibility,
         },
       ],
     });
@@ -556,18 +604,24 @@ g.test('buffer,resource_state')
 g.test('texture,resource_state')
   .desc('Test bind group creation with various texture resource states')
   .paramsSubcasesOnly(u =>
-    u.combine('state', kResourceStates).combine('entry', sampledAndStorageBindingEntries(true))
+    u
+      .combine('state', kResourceStates)
+      .combine('entry', sampledAndStorageBindingEntries(true, kTestFormat))
+      .combine('visibilityMask', [kAllShaderStages, GPUConst.ShaderStage.COMPUTE] as const)
   )
   .fn(t => {
-    const { state, entry } = t.params;
+    const { state, entry, visibilityMask } = t.params;
     const info = texBindingTypeInfo(entry);
+
+    const visibility = info.validStages & visibilityMask;
+    skipIfResourceNotSupportedInStages(t, entry, visibility);
 
     const bgl = t.device.createBindGroupLayout({
       entries: [
         {
           ...entry,
           binding: 0,
-          visibility: info.validStages,
+          visibility,
         },
       ],
     });
@@ -607,9 +661,7 @@ g.test('bind_group_layout,device_mismatch')
     'Tests createBindGroup cannot be called with a bind group layout created from another device'
   )
   .paramsSubcasesOnly(u => u.combine('mismatched', [true, false]))
-  .beforeAllSubcases(t => {
-    t.selectMismatchedDeviceOrSkipTestCase(undefined);
-  })
+  .beforeAllSubcases(t => t.usesMismatchedDevice())
   .fn(t => {
     const mismatched = t.params.mismatched;
 
@@ -619,7 +671,7 @@ g.test('bind_group_layout,device_mismatch')
       entries: [
         {
           binding: 0,
-          visibility: GPUConst.ShaderStage.VERTEX,
+          visibility: GPUConst.ShaderStage.COMPUTE,
           buffer: {},
         },
       ],
@@ -665,14 +717,15 @@ g.test('binding_resources,device_mismatch')
         { resource0Mismatched: true, resource1Mismatched: false },
         { resource0Mismatched: false, resource1Mismatched: true },
       ])
+      .combine('visibilityMask', [kAllShaderStages, GPUConst.ShaderStage.COMPUTE] as const)
   )
-  .beforeAllSubcases(t => {
-    t.selectMismatchedDeviceOrSkipTestCase(undefined);
-  })
+  .beforeAllSubcases(t => t.usesMismatchedDevice())
   .fn(t => {
-    const { entry, resource0Mismatched, resource1Mismatched } = t.params;
+    const { entry, resource0Mismatched, resource1Mismatched, visibilityMask } = t.params;
 
     const info = bindingTypeInfo(entry);
+    const visibility = info.validStages & visibilityMask;
+    skipIfResourceNotSupportedInStages(t, entry, visibility);
 
     const resource0 = resource0Mismatched
       ? t.getDeviceMismatchedBindingResource(info.resource)
@@ -685,12 +738,12 @@ g.test('binding_resources,device_mismatch')
       entries: [
         {
           binding: 0,
-          visibility: info.validStages,
+          visibility,
           ...entry,
         },
         {
           binding: 1,
-          visibility: info.validStages,
+          visibility,
           ...entry,
         },
       ],
@@ -736,7 +789,7 @@ g.test('storage_texture,usage')
       entries: [
         {
           binding: 0,
-          visibility: GPUShaderStage.FRAGMENT,
+          visibility: GPUShaderStage.COMPUTE,
           storageTexture: { access: 'write-only', format: 'rgba8unorm' },
         },
       ],
@@ -779,7 +832,7 @@ g.test('storage_texture,mip_level_count')
       entries: [
         {
           binding: 0,
-          visibility: GPUShaderStage.FRAGMENT,
+          visibility: GPUShaderStage.COMPUTE,
           storageTexture: { access: 'write-only', format: 'rgba8unorm' },
         },
       ],
@@ -812,21 +865,18 @@ g.test('storage_texture,format')
   )
   .params(u =>
     u //
-      .combine('storageTextureFormat', kStorageTextureFormats)
-      .combine('resourceFormat', kStorageTextureFormats)
+      .combine('storageTextureFormat', kPossibleStorageTextureFormats)
+      .combine('resourceFormat', kPossibleStorageTextureFormats)
   )
-  .beforeAllSubcases(t => {
-    const { storageTextureFormat, resourceFormat } = t.params;
-    t.skipIfTextureFormatNotUsableAsStorageTexture(storageTextureFormat, resourceFormat);
-  })
   .fn(t => {
     const { storageTextureFormat, resourceFormat } = t.params;
+    t.skipIfTextureFormatNotUsableAsStorageTexture(storageTextureFormat, resourceFormat);
 
     const bindGroupLayout = t.device.createBindGroupLayout({
       entries: [
         {
           binding: 0,
-          visibility: GPUShaderStage.FRAGMENT,
+          visibility: GPUShaderStage.COMPUTE,
           storageTexture: { access: 'write-only', format: storageTextureFormat },
         },
       ],
@@ -1077,9 +1127,7 @@ g.test('buffer,effective_buffer_binding_size')
 g.test('sampler,device_mismatch')
   .desc(`Tests createBindGroup cannot be called with a sampler created from another device.`)
   .paramsSubcasesOnly(u => u.combine('mismatched', [true, false]))
-  .beforeAllSubcases(t => {
-    t.selectMismatchedDeviceOrSkipTestCase(undefined);
-  })
+  .beforeAllSubcases(t => t.usesMismatchedDevice())
   .fn(t => {
     const { mismatched } = t.params;
 
@@ -1089,7 +1137,7 @@ g.test('sampler,device_mismatch')
       entries: [
         {
           binding: 0,
-          visibility: GPUShaderStage.FRAGMENT,
+          visibility: GPUShaderStage.COMPUTE,
           sampler: { type: 'filtering' as const },
         },
       ],
@@ -1125,7 +1173,7 @@ g.test('sampler,compare_function_with_binding_type')
       entries: [
         {
           binding: 0,
-          visibility: GPUShaderStage.FRAGMENT,
+          visibility: GPUShaderStage.COMPUTE,
           sampler: { type: bgType },
         },
       ],
@@ -1142,4 +1190,218 @@ g.test('sampler,compare_function_with_binding_type')
         layout: bindGroupLayout,
       });
     }, !isValid);
+  });
+
+g.test('external_texture,texture_view,usage')
+  .desc(
+    `
+    Test that the external texture usage contains TEXTURE_BINDING if the BindGroup entry defines
+    externalTexture for a GPUTextureView resource.
+  `
+  )
+  .params(u =>
+    u //
+      // If usage0 and usage1 are the same, the usage being test is a single usage. Otherwise, it's
+      // a combined usage.
+      .combine('usage0', kTextureUsages)
+      .combine('usage1', kTextureUsages)
+  )
+  .fn(t => {
+    const { usage0, usage1 } = t.params;
+
+    const usage = usage0 | usage1;
+
+    const bindGroupLayout = t.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.FRAGMENT,
+          externalTexture: {},
+        },
+      ],
+    });
+
+    const texture = t.createTextureTracked({
+      size: { width: 16, height: 16, depthOrArrayLayers: 1 },
+      format: 'rgba8unorm' as const,
+      usage,
+    });
+
+    const isValid = GPUTextureUsage.TEXTURE_BINDING & usage;
+
+    const textureView = texture.createView();
+    t.expectValidationError(() => {
+      t.device.createBindGroup({
+        entries: [{ binding: 0, resource: textureView }],
+        layout: bindGroupLayout,
+      });
+    }, !isValid);
+  });
+
+g.test('external_texture,texture_view,dimension')
+  .desc(
+    `
+    Test that the external texture dimension is 2d if the BindGroup entry defines
+    externalTexture for a GPUTextureView resource.
+  `
+  )
+  .params(u => u.combine('dimension', kTextureViewDimensions))
+  .fn(t => {
+    const { dimension } = t.params;
+    t.skipIfTextureViewDimensionNotSupported(dimension);
+
+    const bindGroupLayout = t.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.FRAGMENT,
+          externalTexture: {},
+        },
+      ],
+    });
+
+    let height = 16;
+    let depthOrArrayLayers = 6;
+    if (dimension === '1d') {
+      height = 1;
+      depthOrArrayLayers = 1;
+    }
+
+    const texture = t.createTextureTracked({
+      size: { width: 16, height, depthOrArrayLayers },
+      format: 'rgba8unorm' as const,
+      usage: GPUConst.TextureUsage.TEXTURE_BINDING,
+      dimension: getTextureDimensionFromView(dimension),
+    });
+
+    const shouldError = dimension !== '2d';
+    const textureView = texture.createView({ dimension });
+
+    t.expectValidationError(() => {
+      t.device.createBindGroup({
+        entries: [{ binding: 0, resource: textureView }],
+        layout: bindGroupLayout,
+      });
+    }, shouldError);
+  });
+
+g.test('external_texture,texture_view,mip_level_count')
+  .desc(
+    `
+    Test that the mip level count of the resource of the BindGroup entry as a descriptor is 1 if the
+    BindGroup entry defines externalTexture for a GPUTextureView resource. If the mip level count is
+    not 1, a validation error should be generated.
+  `
+  )
+  .params(u =>
+    u //
+      .combine('baseMipLevel', [1, 2])
+      .combine('mipLevelCount', [1, 2])
+  )
+  .fn(t => {
+    const { baseMipLevel, mipLevelCount } = t.params;
+
+    const bindGroupLayout = t.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.FRAGMENT,
+          externalTexture: {},
+        },
+      ],
+    });
+
+    const MIP_LEVEL_COUNT = 4;
+    const texture = t.createTextureTracked({
+      size: { width: 16, height: 16, depthOrArrayLayers: 1 },
+      format: 'rgba8unorm' as const,
+      usage: GPUTextureUsage.TEXTURE_BINDING,
+      mipLevelCount: MIP_LEVEL_COUNT,
+    });
+
+    const textureView = texture.createView({ baseMipLevel, mipLevelCount });
+
+    t.expectValidationError(() => {
+      t.device.createBindGroup({
+        entries: [{ binding: 0, resource: textureView }],
+        layout: bindGroupLayout,
+      });
+    }, mipLevelCount !== 1);
+  });
+
+g.test('external_texture,texture_view,format')
+  .desc(
+    `
+    Test that the format of the external texture is "rgba8unorm", "bgra8unorm", or "rgba16float"
+    if the BindGroup entry defines externalTexture for a GPUTextureView resource.
+  `
+  )
+  .params(u => u.combine('format', kRegularTextureFormats))
+  .fn(t => {
+    const { format } = t.params;
+    t.skipIfTextureFormatNotSupported(format);
+
+    const bindGroupLayout = t.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.FRAGMENT,
+          externalTexture: {},
+        },
+      ],
+    });
+
+    const texture = t.createTextureTracked({
+      size: { width: 16, height: 16, depthOrArrayLayers: 1 },
+      format,
+      usage: GPUTextureUsage.TEXTURE_BINDING,
+    });
+
+    const isValid = format === 'rgba8unorm' || format === 'bgra8unorm' || format === 'rgba16float';
+    const textureView = texture.createView({ format });
+    t.expectValidationError(() => {
+      t.device.createBindGroup({
+        entries: [{ binding: 0, resource: textureView }],
+        layout: bindGroupLayout,
+      });
+    }, !isValid);
+  });
+
+g.test('external_texture,texture_view,sample_count')
+  .desc(
+    `
+  Test that the sample count of the resource of the BindGroup entry as a texture is 1 if the
+  BindGroup entry defines externalTexture for a GPUTextureView resource. If the sample count is
+  not 1, a validation error should be generated.
+`
+  )
+  .params(u => u.combine('sampleCount', [1, 4]))
+  .fn(t => {
+    const { sampleCount } = t.params;
+
+    const bindGroupLayout = t.device.createBindGroupLayout({
+      entries: [
+        {
+          binding: 0,
+          visibility: GPUShaderStage.FRAGMENT,
+          externalTexture: {},
+        },
+      ],
+    });
+
+    const texture = t.createTextureTracked({
+      size: { width: 16, height: 16, depthOrArrayLayers: 1 },
+      format: 'rgba8unorm' as const,
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
+      sampleCount,
+    });
+
+    const textureView = texture.createView();
+
+    t.expectValidationError(() => {
+      t.device.createBindGroup({
+        entries: [{ binding: 0, resource: textureView }],
+        layout: bindGroupLayout,
+      });
+    }, sampleCount !== 1);
   });

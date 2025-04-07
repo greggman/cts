@@ -3,7 +3,10 @@ copyExternalImageToTexture from ImageData source.
 `;
 
 import { makeTestGroup } from '../../../common/framework/test_group.js';
-import { kTextureFormatInfo, kValidTextureFormatsForCopyE2T } from '../../format_info.js';
+import {
+  getBaseFormatForRegularTextureFormat,
+  kValidTextureFormatsForCopyE2T,
+} from '../../format_info.js';
 import { TextureUploadingUtils, kCopySubrectInfo } from '../../util/copy_to_texture.js';
 
 import { kTestColorsAll, makeTestColorsTexelView } from './util.js';
@@ -47,10 +50,11 @@ g.test('from_ImageData')
       .combine('height', [1, 2, 4, 15, 255, 256])
   )
   .beforeAllSubcases(t => {
-    t.skipIfTextureFormatNotSupported(t.params.dstColorFormat);
+    t.skipIf(typeof ImageData === 'undefined', 'ImageData does not exist in this environment');
   })
   .fn(t => {
     const { width, height, dstColorFormat, dstPremultiplied, srcDoFlipYDuringCopy } = t.params;
+    t.skipIfTextureFormatNotSupported(dstColorFormat);
 
     const testColors = kTestColorsAll;
 
@@ -78,7 +82,7 @@ g.test('from_ImageData')
         GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC | GPUTextureUsage.RENDER_ATTACHMENT,
     });
 
-    const expFormat = kTextureFormatInfo[dstColorFormat].baseFormat ?? dstColorFormat;
+    const expFormat = getBaseFormatForRegularTextureFormat(dstColorFormat) ?? dstColorFormat;
     const flipSrcBeforeCopy = false;
     const texelViewExpected = t.getExpectedDstPixelsFromSrcPixels({
       srcPixels: imageData.data,
@@ -152,6 +156,9 @@ g.test('copy_subrect_from_ImageData')
       .beginSubcases()
       .combine('copySubRectInfo', kCopySubrectInfo)
   )
+  .beforeAllSubcases(t => {
+    t.skipIf(typeof ImageData === 'undefined', 'ImageData does not exist in this environment');
+  })
   .fn(t => {
     const { copySubRectInfo, dstPremultiplied, srcDoFlipYDuringCopy } = t.params;
 

@@ -77,12 +77,9 @@ combine('offset', [false, true]).
 beginSubcases().
 combine('samplePoints', kSamplePointMethods).
 combine('A', ['i32', 'u32']).
-combine('compare', kCompareFunctions)
+combine('compare', kCompareFunctions).
+combine('depthOrArrayLayers', [1, 8])
 ).
-beforeAllSubcases((t) => {
-  t.skipIfTextureFormatNotSupported(t.params.format);
-  t.selectDeviceForTextureFormatOrSkipTestCase(t.params.format);
-}).
 fn(async (t) => {
   const {
     format,
@@ -93,16 +90,19 @@ fn(async (t) => {
     modeV,
     filt: minFilter,
     compare,
-    offset
+    offset,
+    depthOrArrayLayers
   } = t.params;
+  t.skipIfTextureFormatNotSupported(format);
 
-  const viewDimension = '2d-array';
-  const size = chooseTextureSize({ minSize: 8, minBlocks: 4, format, viewDimension });
+  const [width, height] = chooseTextureSize({ minSize: 8, minBlocks: 4, format });
+  const size = { width, height, depthOrArrayLayers };
 
   const descriptor = {
     format,
     size,
-    usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING
+    usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING,
+    ...(t.isCompatibility && { textureBindingViewDimension: '2d-array' })
   };
   const { texels, texture } = await createTextureWithRandomDataAndGetTexels(t, descriptor, {
     generator: makeRandomDepthComparisonTexelGenerator(descriptor, compare)
@@ -137,7 +137,7 @@ fn(async (t) => {
     };
   });
   const textureType = 'texture_depth_2d_array';
-  const viewDescriptor = {};
+  const viewDescriptor = { dimension: '2d-array' };
   const results = await doTextureCalls(
     t,
     texture,
@@ -189,12 +189,10 @@ combine('samplePoints', kCubeSamplePointMethods).
 combine('A', ['i32', 'u32']).
 combine('compare', kCompareFunctions)
 ).
-beforeAllSubcases((t) => {
-  t.skipIfTextureViewDimensionNotSupported('cube-array');
-  t.selectDeviceForTextureFormatOrSkipTestCase(t.params.format);
-}).
 fn(async (t) => {
   const { format, A, stage, samplePoints, mode, filt: minFilter, compare } = t.params;
+  t.skipIfTextureViewDimensionNotSupported('cube-array');
+  t.skipIfTextureFormatNotSupported(format);
 
   const viewDimension = 'cube-array';
   const size = chooseTextureSize({ minSize: 8, minBlocks: 2, format, viewDimension });
@@ -296,9 +294,9 @@ combine('C', ['i32', 'u32']).
 combine('samplePoints', kSamplePointMethods).
 combine('compare', kCompareFunctions)
 ).
-beforeAllSubcases((t) => t.selectDeviceForTextureFormatOrSkipTestCase(t.params.format)).
 fn(async (t) => {
   const { format, C, stage, samplePoints, mode, compare, filt: minFilter, offset } = t.params;
+  t.skipIfTextureFormatNotSupported(format);
 
   const size = chooseTextureSize({ minSize: 8, minBlocks: 4, format });
   const descriptor = {
@@ -384,9 +382,9 @@ beginSubcases().
 combine('samplePoints', kCubeSamplePointMethods).
 combine('compare', kCompareFunctions)
 ).
-beforeAllSubcases((t) => t.selectDeviceForTextureFormatOrSkipTestCase(t.params.format)).
 fn(async (t) => {
   const { format, stage, samplePoints, mode, filt: minFilter, compare } = t.params;
+  t.skipIfTextureFormatNotSupported(format);
 
   const viewDimension = 'cube';
   const size = chooseTextureSize({ minSize: 8, minBlocks: 2, format, viewDimension });

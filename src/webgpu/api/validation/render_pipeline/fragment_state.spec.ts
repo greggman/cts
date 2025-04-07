@@ -1,22 +1,28 @@
 export const description = `
 This test dedicatedly tests validation of GPUFragmentState of createRenderPipeline.
+
+TODO(#3363): Make this into a MaxLimitTest and increase kMaxColorAttachments.
 `;
 
 import { makeTestGroup } from '../../../../common/framework/test_group.js';
 import { assert, range } from '../../../../common/util/util.js';
 import {
+  getDefaultLimits,
   IsDualSourceBlendingFactor,
   kBlendFactors,
   kBlendOperations,
-  kMaxColorAttachmentsToTest,
 } from '../../../capability_info.js';
 import { GPUConst } from '../../../constants.js';
 import {
   kAllTextureFormats,
-  kRenderableColorTextureFormats,
-  kTextureFormatInfo,
   computeBytesPerSampleFromFormats,
   kColorTextureFormats,
+  isTextureFormatColorRenderable,
+  isTextureFormatBlendable,
+  getTextureFormatColorType,
+  isColorTextureFormat,
+  kPossibleColorRenderableTextureFormats,
+  getColorRenderByteCost,
 } from '../../../format_info.js';
 import {
   getFragmentShaderCodeWithOutput,
@@ -27,6 +33,10 @@ import {
 import { kTexelRepresentationInfo } from '../../../util/texture/texel_data.js';
 
 import { ColorTargetState, CreateRenderPipelineValidationTest } from './common.js';
+
+// MAINTENANCE_TODO: This should be changed to kMaxColorAttachmentsToTest
+// when this is made a MaxLimitTest (see above).
+const kMaxColorAttachments = getDefaultLimits('core').maxColorAttachments.default;
 
 export const g = makeTestGroup(CreateRenderPipelineValidationTest);
 
@@ -63,20 +73,15 @@ g.test('targets_format_is_color_format')
       // Test all non-color texture formats, plus 'rgba8unorm' as a control case.
       .combine('format', kAllTextureFormats)
       .filter(({ format }) => {
-        return format === 'rgba8unorm' || !kTextureFormatInfo[format].color;
+        return format === 'rgba8unorm' || !isColorTextureFormat(format);
       })
       .combine('isAsync', [false, true])
       .beginSubcases()
       .combine('fragOutType', ['f32', 'u32', 'i32'] as const)
   )
-  .beforeAllSubcases(t => {
-    const { format } = t.params;
-    const info = kTextureFormatInfo[format];
-    t.skipIfTextureFormatNotSupported(t.params.format);
-    t.selectDeviceOrSkipTestCase(info.feature);
-  })
   .fn(t => {
     const { isAsync, format, fragOutType } = t.params;
+    t.skipIfTextureFormatNotSupported(format);
 
     const fragmentShaderCode = getFragmentShaderCodeWithOutput([
       { values, plainType: fragOutType, componentCount: 4 },
@@ -107,19 +112,17 @@ g.test('targets_format_renderable')
       .combine('isAsync', [false, true])
       .combine('format', kColorTextureFormats)
   )
-  .beforeAllSubcases(t => {
-    const { format } = t.params;
-    const info = kTextureFormatInfo[format];
-    t.skipIfTextureFormatNotSupported(t.params.format);
-    t.selectDeviceOrSkipTestCase(info.feature);
-  })
   .fn(t => {
     const { isAsync, format } = t.params;
-    const info = kTextureFormatInfo[format];
+    t.skipIfTextureFormatNotSupported(format);
 
     const descriptor = t.getDescriptor({ targets: [{ format }] });
 
-    t.doCreateRenderPipelineTest(isAsync, !!info.colorRender, descriptor);
+    t.doCreateRenderPipelineTest(
+      isAsync,
+      isTextureFormatColorRenderable(t.device, format),
+      descriptor
+    );
   });
 
 g.test('limits,maxColorAttachments')
@@ -165,20 +168,17 @@ g.test('limits,maxColorAttachmentBytesPerSample,aligned')
   )
   .params(u =>
     u
-      .combine('format', kRenderableColorTextureFormats)
+      .combine('format', kPossibleColorRenderableTextureFormats)
       .beginSubcases()
       .combine(
         'attachmentCount',
-        range(kMaxColorAttachmentsToTest, i => i + 1)
+        range(kMaxColorAttachments, i => i + 1)
       )
       .combine('isAsync', [false, true])
   )
-  .beforeAllSubcases(t => {
-    t.skipIfTextureFormatNotSupported(t.params.format);
-  })
   .fn(t => {
     const { format, attachmentCount, isAsync } = t.params;
-    const info = kTextureFormatInfo[format];
+    t.skipIfTextureFormatNotSupported(format);
 
     t.skipIf(
       attachmentCount > t.device.limits.maxColorAttachments,
@@ -191,8 +191,8 @@ g.test('limits,maxColorAttachmentBytesPerSample,aligned')
       }),
     });
     const shouldError =
-      info.colorRender === undefined ||
-      info.colorRender.byteCost * attachmentCount >
+      !isTextureFormatColorRenderable(t.device, format) ||
+      getColorRenderByteCost(format) * attachmentCount >
         t.device.limits.maxColorAttachmentBytesPerSample;
 
     t.doCreateRenderPipelineTest(isAsync, !shouldError, descriptor);
@@ -251,19 +251,14 @@ g.test('targets_format_filterable')
   .params(u =>
     u
       .combine('isAsync', [false, true])
-      .combine('format', kRenderableColorTextureFormats)
+      .combine('format', kPossibleColorRenderableTextureFormats)
       .beginSubcases()
       .combine('hasBlend', [false, true])
   )
-  .beforeAllSubcases(t => {
-    const { format } = t.params;
-    const info = kTextureFormatInfo[format];
-    t.skipIfTextureFormatNotSupported(format);
-    t.selectDeviceOrSkipTestCase(info.feature);
-  })
   .fn(t => {
     const { isAsync, format, hasBlend } = t.params;
-    const info = kTextureFormatInfo[format];
+    t.skipIfTextureFormatNotSupported(format);
+    t.skipIfTextureFormatNotUsableAsRenderAttachment(format);
 
     const descriptor = t.getDescriptor({
       targets: [
@@ -274,8 +269,7 @@ g.test('targets_format_filterable')
       ],
     });
 
-    const supportsBlend = info.colorRender?.blend;
-    assert(supportsBlend !== undefined);
+    const supportsBlend = isTextureFormatBlendable(t.device, format);
     t.doCreateRenderPipelineTest(isAsync, !hasBlend || supportsBlend, descriptor);
   });
 
@@ -296,14 +290,11 @@ g.test('targets_blend')
       .beginSubcases()
       .combine('operation', kBlendOperations)
   )
-  .beforeAllSubcases(t => {
-    const { srcFactor, dstFactor } = t.params;
-    if (IsDualSourceBlendingFactor(srcFactor) || IsDualSourceBlendingFactor(dstFactor)) {
-      t.selectDeviceOrSkipTestCase('dual-source-blending');
-    }
-  })
   .fn(t => {
     const { isAsync, component, srcFactor, dstFactor, operation } = t.params;
+    if (IsDualSourceBlendingFactor(srcFactor) || IsDualSourceBlendingFactor(dstFactor)) {
+      t.skipIfDeviceDoesNotHaveFeature('dual-source-blending');
+    }
 
     const defaultBlendComponent: GPUBlendComponent = {
       srcFactor: 'src-alpha',
@@ -375,7 +366,7 @@ g.test('pipeline_output_targets')
   .params(u =>
     u
       .combine('isAsync', [false, true])
-      .combine('format', [undefined, ...kRenderableColorTextureFormats] as const)
+      .combine('format', [undefined, ...kPossibleColorRenderableTextureFormats] as const)
       .beginSubcases()
       .combine('shaderOutput', [
         undefined,
@@ -386,11 +377,10 @@ g.test('pipeline_output_targets')
         p.format !== undefined && p.shaderOutput !== undefined ? [0, 0x1, 0x2, 0x4, 0x8] : [0xf]
       )
   )
-  .beforeAllSubcases(t => {
-    t.selectDeviceForTextureFormatOrSkipTestCase(t.params.format);
-  })
   .fn(t => {
     const { isAsync, format, writeMask, shaderOutput } = t.params;
+    t.skipIfTextureFormatNotSupported(format);
+    t.skipIfTextureFormatNotUsableAsRenderAttachment(format);
 
     const descriptor = t.getDescriptor({
       targets: format ? [{ format, writeMask }] : [],
@@ -408,9 +398,8 @@ g.test('pipeline_output_targets')
       // There is a color target
       if (shaderOutput) {
         // The shader outputs to the color target
-        const info = kTextureFormatInfo[format];
         success =
-          shaderOutput.scalar === getPlainTypeInfo(info.color.type) &&
+          shaderOutput.scalar === getPlainTypeInfo(getTextureFormatColorType(format)) &&
           shaderOutput.count >= kTexelRepresentationInfo[format].componentOrder.length;
       } else {
         // The shader does not output to the color target
@@ -441,23 +430,6 @@ g.test('pipeline_output_targets,blend')
         ...u.combine('alphaDstFactor', kBlendFactors),
       ] as const)
   )
-  .beforeAllSubcases(t => {
-    const { format, colorSrcFactor, colorDstFactor, alphaSrcFactor, alphaDstFactor } = t.params;
-
-    const info = kTextureFormatInfo[format];
-    const requiredFeatures: (GPUFeatureName | undefined)[] = [info.feature];
-
-    if (
-      IsDualSourceBlendingFactor(colorSrcFactor) ||
-      IsDualSourceBlendingFactor(colorDstFactor) ||
-      IsDualSourceBlendingFactor(alphaSrcFactor) ||
-      IsDualSourceBlendingFactor(alphaDstFactor)
-    ) {
-      requiredFeatures.push('dual-source-blending');
-    }
-
-    t.selectDeviceOrSkipTestCase(requiredFeatures);
-  })
   .fn(t => {
     const sampleType = 'float';
     const {
@@ -469,13 +441,16 @@ g.test('pipeline_output_targets,blend')
       alphaSrcFactor,
       alphaDstFactor,
     } = t.params;
-    const info = kTextureFormatInfo[format];
+    t.skipIfTextureFormatNotSupported(format);
 
     const useDualSourceBlending =
       IsDualSourceBlendingFactor(colorSrcFactor) ||
       IsDualSourceBlendingFactor(colorDstFactor) ||
       IsDualSourceBlendingFactor(alphaSrcFactor) ||
       IsDualSourceBlendingFactor(alphaDstFactor);
+    if (useDualSourceBlending) {
+      t.skipIfDeviceDoesNotHaveFeature('dual-source-blending');
+    }
 
     const descriptor = t.getDescriptor({
       targets: [
@@ -501,7 +476,7 @@ g.test('pipeline_output_targets,blend')
       colorDstFactor?.includes('src1-alpha');
     const meetsExtraBlendingRequirement = !colorBlendReadsSrcAlpha || componentCount === 4;
     const _success =
-      info.color.type === sampleType &&
+      getTextureFormatColorType(format) === sampleType &&
       componentCount >= kTexelRepresentationInfo[format].componentOrder.length &&
       meetsExtraBlendingRequirement;
     t.doCreateRenderPipelineTest(isAsync, _success, descriptor);
@@ -520,7 +495,6 @@ g.test('dual_source_blending,color_target_count')
    corresponding blending unit), there must be exactly one color target.
 `
   )
-  .beforeAllSubcases(t => t.selectDeviceOrSkipTestCase('dual-source-blending'))
   .params(u =>
     u
       .combine('blendFactor', kDualSourceBlendingFactors)
@@ -530,6 +504,7 @@ g.test('dual_source_blending,color_target_count')
       .combine('component', ['color', 'alpha'] as const)
   )
   .fn(t => {
+    t.skipIfDeviceDoesNotHaveFeature('dual-source-blending');
     const { blendFactor, colorTargetsCount, maskOutNonZeroIndexColorTargets, component } = t.params;
 
     const defaultBlendComponent: GPUBlendComponent = {
@@ -586,7 +561,6 @@ g.test('dual_source_blending,use_blend_src')
     factor must use src1 (the second input of the corresponding blending unit).
 `
   )
-  .beforeAllSubcases(t => t.selectDeviceOrSkipTestCase('dual-source-blending'))
   .params(u =>
     u
       .combine('blendFactor', kBlendFactors)
@@ -596,6 +570,7 @@ g.test('dual_source_blending,use_blend_src')
       .combine('component', ['color', 'alpha'] as const)
   )
   .fn(t => {
+    t.skipIfDeviceDoesNotHaveFeature('dual-source-blending');
     const { blendFactor, useBlendSrc1, writeMask, component } = t.params;
 
     const defaultBlendComponent: GPUBlendComponent = {

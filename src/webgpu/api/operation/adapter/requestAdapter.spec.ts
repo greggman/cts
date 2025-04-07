@@ -4,6 +4,7 @@ Tests for GPU.requestAdapter.
 Test all possible options to requestAdapter.
 default, low-power, and high performance should all always return adapters.
 forceFallbackAdapter may or may not return an adapter.
+invalid featureLevel values should not return an adapter.
 
 GPU.requestAdapter can technically return null for any reason
 but we need test functionality so the test requires an adapter except
@@ -26,6 +27,8 @@ const powerPreferenceModes: Array<GPUPowerPreference | undefined> = [
   'high-performance',
 ];
 const forceFallbackOptions: Array<boolean | undefined> = [undefined, false, true];
+const validFeatureLevels: Array<string | undefined> = [undefined, 'core', 'compatibility'];
+const invalidFeatureLevels: Array<string> = ['cor', 'Core', 'compatability', '', ' '];
 
 async function testAdapter(t: Fixture, adapter: GPUAdapter | null) {
   assert(adapter !== null, 'Failed to get adapter.');
@@ -111,13 +114,31 @@ g.test('requestAdapter')
       ...(forceFallbackAdapter !== undefined && { forceFallbackAdapter }),
     });
 
-    // failing to create an adapter when forceFallbackAdapter is true is ok.
-    if (forceFallbackAdapter && !adapter) {
-      t.skip('No adapter available');
+    if (!adapter) {
+      // Failing to create an adapter is only OK when forceFallbackAdapter is true.
+      t.expect(forceFallbackAdapter === true);
+
+      // Mark the test as skipped (as long as nothing else failed before this point).
+      t.skip('No fallback adapter available');
       return;
     }
 
+    t.expect(adapter.info.isFallbackAdapter === Boolean(forceFallbackAdapter));
     await testAdapter(t, adapter);
+  });
+
+g.test('requestAdapter_invalid_featureLevel')
+  .desc(`request adapter with invalid featureLevel string values return null`)
+  .params(u => u.combine('featureLevel', [...validFeatureLevels, ...invalidFeatureLevels]))
+  .fn(async t => {
+    const { featureLevel } = t.params;
+    const adapter = await getGPU(t.rec).requestAdapter({ featureLevel });
+
+    if (!validFeatureLevels.includes(featureLevel)) {
+      assert(adapter === null);
+    } else {
+      await testAdapter(t, adapter);
+    }
   });
 
 g.test('requestAdapter_no_parameters')

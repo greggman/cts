@@ -4,7 +4,8 @@ Buffer Usages Validation Tests in Render Pass and Compute Pass.
 
 import { makeTestGroup } from '../../../../../common/framework/test_group.js';
 import { assert, unreachable } from '../../../../../common/util/util.js';
-import { ValidationTest } from '../../validation_test.js';
+import { GPUTestBase } from '../../../../gpu_test.js';
+import { AllFeaturesMaxLimitsValidationTest } from '../../validation_test.js';
 
 const kBoundBufferSize = 256;
 
@@ -27,15 +28,18 @@ export const kAllBufferUsages: BufferUsage[] = [
   'indexedIndirect',
 ];
 
-export class BufferResourceUsageTest extends ValidationTest {
+function resourceVisibilityToVisibility(resourceVisibility: 'compute' | 'fragment') {
+  return resourceVisibility === 'compute' ? GPUShaderStage.COMPUTE : GPUShaderStage.FRAGMENT;
+}
+
+export class BufferResourceUsageTest extends AllFeaturesMaxLimitsValidationTest {
   createBindGroupLayoutForTest(
     type: 'uniform' | 'storage' | 'read-only-storage',
     resourceVisibility: 'compute' | 'fragment'
   ): GPUBindGroupLayout {
     const bindGroupLayoutEntry: GPUBindGroupLayoutEntry = {
       binding: 0,
-      visibility:
-        resourceVisibility === 'compute' ? GPUShaderStage.COMPUTE : GPUShaderStage.FRAGMENT,
+      visibility: resourceVisibilityToVisibility(resourceVisibility),
       buffer: {
         type,
       },
@@ -138,6 +142,44 @@ function IsBufferUsageInBindGroup(bufferUsage: BufferUsage): boolean {
   }
 }
 
+function skipIfStorageBuffersNotAvailableInStages(
+  t: GPUTestBase,
+  visibility: number,
+  numRequired: number
+) {
+  if (t.isCompatibility) {
+    t.skipIf(
+      (visibility & GPUShaderStage.FRAGMENT) !== 0 &&
+        !(t.device.limits.maxStorageBuffersInFragmentStage! >= numRequired),
+      `maxStorageBuffersInFragmentStage${t.device.limits.maxStorageBuffersInFragmentStage} < ${numRequired}`
+    );
+    t.skipIf(
+      (visibility & GPUShaderStage.VERTEX) !== 0 &&
+        !(t.device.limits.maxStorageBuffersInVertexStage! >= numRequired),
+      `maxStorageBuffersInVertexStage${t.device.limits.maxStorageBuffersInVertexStage} < ${numRequired}`
+    );
+  }
+}
+
+/**
+ * Skips test if usage is a storage buffer and there are not numRequired
+ * storage buffers supported for the given visibility.
+ */
+export function skipIfStorageBuffersUsedAndNotAvailableInStages(
+  t: GPUTestBase,
+  usage: BufferUsage | 'copy-src' | 'copy-dst',
+  visibility: 'fragment' | 'compute',
+  numRequired: number
+) {
+  if (usage === 'storage' || usage === 'read-only-storage') {
+    skipIfStorageBuffersNotAvailableInStages(
+      t,
+      resourceVisibilityToVisibility(visibility),
+      numRequired
+    );
+  }
+}
+
 export const g = makeTestGroup(BufferResourceUsageTest);
 
 g.test('subresources,buffer_usage_in_one_compute_pass_with_no_dispatch')
@@ -158,6 +200,19 @@ bindGroup, dynamicOffsets), do not contribute directly to a usage scope.`
   )
   .fn(t => {
     const { usage0, usage1, visibility0, visibility1, hasOverlap } = t.params;
+    const numStorageBuffersNeededInFragmentStage = 1;
+    skipIfStorageBuffersUsedAndNotAvailableInStages(
+      t,
+      usage0,
+      visibility0,
+      numStorageBuffersNeededInFragmentStage
+    );
+    skipIfStorageBuffersUsedAndNotAvailableInStages(
+      t,
+      usage1,
+      visibility1,
+      numStorageBuffersNeededInFragmentStage
+    );
 
     const buffer = t.createBufferWithState('valid', {
       size: kBoundBufferSize * 2,
@@ -255,6 +310,19 @@ have tests covered (https://github.com/gpuweb/cts/issues/2232)
       visibility1,
       hasOverlap,
     } = t.params;
+    const numStorageBuffersNeededInFragmentStage = 1;
+    skipIfStorageBuffersUsedAndNotAvailableInStages(
+      t,
+      usage0,
+      visibility0,
+      numStorageBuffersNeededInFragmentStage
+    );
+    skipIfStorageBuffersUsedAndNotAvailableInStages(
+      t,
+      usage1,
+      visibility1,
+      numStorageBuffersNeededInFragmentStage
+    );
 
     const buffer = t.createBufferWithState('valid', {
       size: kBoundBufferSize * 2,
@@ -476,6 +544,20 @@ there is no draw call in the render pass.
   .fn(t => {
     const { usage0, usage1, hasOverlap, visibility0, visibility1 } = t.params;
 
+    const numStorageBuffersNeededInFragmentStage = 1;
+    skipIfStorageBuffersUsedAndNotAvailableInStages(
+      t,
+      usage0,
+      visibility0,
+      numStorageBuffersNeededInFragmentStage
+    );
+    skipIfStorageBuffersUsedAndNotAvailableInStages(
+      t,
+      usage1,
+      visibility1,
+      numStorageBuffersNeededInFragmentStage
+    );
+
     const UseBufferOnRenderPassEncoder = (
       buffer: GPUBuffer,
       offset: number,
@@ -627,6 +709,21 @@ have tests covered (https://github.com/gpuweb/cts/issues/2232)
       visibility1,
       hasOverlap,
     } = t.params;
+
+    const numStorageBuffersNeededInFragmentStage = 1;
+    skipIfStorageBuffersUsedAndNotAvailableInStages(
+      t,
+      usage0,
+      visibility0,
+      numStorageBuffersNeededInFragmentStage
+    );
+    skipIfStorageBuffersUsedAndNotAvailableInStages(
+      t,
+      usage1,
+      visibility1,
+      numStorageBuffersNeededInFragmentStage
+    );
+
     const buffer = t.createBufferWithState('valid', {
       size: kBoundBufferSize * 2,
       usage:
@@ -849,6 +946,21 @@ different render pass encoders belong to different usage scopes.`
         GPUBufferUsage.INDEX |
         GPUBufferUsage.INDIRECT,
     });
+
+    const numStorageBuffersNeededInFragmentStage = 1;
+    skipIfStorageBuffersUsedAndNotAvailableInStages(
+      t,
+      usage0,
+      'fragment',
+      numStorageBuffersNeededInFragmentStage
+    );
+    skipIfStorageBuffersUsedAndNotAvailableInStages(
+      t,
+      usage1,
+      'fragment',
+      numStorageBuffersNeededInFragmentStage
+    );
+
     const UseBufferOnRenderPassEncoderInDrawCall = (
       offset: number,
       usage: BufferUsage,

@@ -38,9 +38,6 @@ fn main() {
 g.test('early_eval')
   .desc('Ensures the builtin is not able to be compile time evaluated')
   .params(u => u.combine('stage', keysOf(kStages)).beginSubcases().combine('builtin', kBuiltins))
-  .beforeAllSubcases(t => {
-    t.selectDeviceOrSkipTestCase('subgroups' as GPUFeatureName);
-  })
   .fn(t => {
     const code = kStages[t.params.stage](t.params.builtin);
     t.expectCompileResult(t.params.stage === 'runtime', code);
@@ -54,9 +51,6 @@ g.test('must_use')
       .beginSubcases()
       .combine('builtin', kBuiltins)
   )
-  .beforeAllSubcases(t => {
-    t.selectDeviceOrSkipTestCase('subgroups' as GPUFeatureName);
-  })
   .fn(t => {
     const wgsl = `
 enable subgroups;
@@ -75,20 +69,11 @@ g.test('data_type')
   .params(u =>
     u.combine('type', keysOf(kArgumentTypes)).beginSubcases().combine('builtin', kBuiltins)
   )
-  .beforeAllSubcases(t => {
-    const features = ['subgroups' as GPUFeatureName];
-    const type = kArgumentTypes[t.params.type];
-    if (type.requiresF16()) {
-      features.push('subgroups-f16' as GPUFeatureName);
-      features.push('shader-f16');
-    }
-    t.selectDeviceOrSkipTestCase(features);
-  })
   .fn(t => {
     const type = kArgumentTypes[t.params.type];
     let enables = `enable subgroups;\n`;
     if (type.requiresF16()) {
-      enables += `enable subgroups_f16;\nenable f16;`;
+      enables += `enable f16;`;
     }
     const wgsl = `
 ${enables}
@@ -121,22 +106,12 @@ g.test('return_type')
       .beginSubcases()
       .combine('builtin', kBuiltins)
   )
-  .beforeAllSubcases(t => {
-    const features = ['subgroups' as GPUFeatureName];
-    const dataType = kArgumentTypes[t.params.dataType];
-    const retType = kArgumentTypes[t.params.retType];
-    if (dataType.requiresF16() || retType.requiresF16()) {
-      features.push('subgroups-f16' as GPUFeatureName);
-      features.push('shader-f16');
-    }
-    t.selectDeviceOrSkipTestCase(features);
-  })
   .fn(t => {
     const dataType = kArgumentTypes[t.params.dataType];
     const retType = kArgumentTypes[t.params.retType];
     let enables = `enable subgroups;\n`;
     if (dataType.requiresF16() || retType.requiresF16()) {
-      enables += `enable subgroups_f16;\nenable f16;`;
+      enables += `enable f16;`;
     }
     const wgsl = `
 ${enables}
@@ -157,9 +132,6 @@ g.test('stage')
       .beginSubcases()
       .combine('builtin', kBuiltins)
   )
-  .beforeAllSubcases(t => {
-    t.selectDeviceOrSkipTestCase('subgroups' as GPUFeatureName);
-  })
   .fn(t => {
     const compute = `
 @compute @workgroup_size(1)
@@ -208,9 +180,6 @@ g.test('invalid_types')
   .params(u =>
     u.combine('case', keysOf(kInvalidTypeCases)).beginSubcases().combine('builtin', kBuiltins)
   )
-  .beforeAllSubcases(t => {
-    t.selectDeviceOrSkipTestCase('subgroups' as GPUFeatureName);
-  })
   .fn(t => {
     const val = kInvalidTypeCases[t.params.case];
     const wgsl = `

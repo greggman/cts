@@ -25,15 +25,16 @@ import {
 import { TestDedicatedWorker, TestSharedWorker, TestServiceWorker } from './helper/test_worker.js';
 
 const rootQuerySpec = 'webgpu:*';
-let promptBeforeReload = false;
 let isFullCTS = false;
 
 globalTestConfig.frameworkDebugLog = console.log;
 
-window.onbeforeunload = () => {
-  // Prompt user before reloading if there are any results
-  return promptBeforeReload ? false : undefined;
-};
+// Prompt before reloading to avoid losing test results.
+function enablePromptBeforeReload() {
+  window.addEventListener('beforeunload', () => {
+    return false;
+  });
+}
 
 const kOpenTestLinkAltText = 'Open';
 
@@ -52,6 +53,8 @@ const { runnow, powerPreference, compatibility, forceFallbackAdapter } = options
 globalTestConfig.enableDebugLogs = options.debug;
 globalTestConfig.unrollConstEvalLoops = options.unrollConstEvalLoops;
 globalTestConfig.compatibility = compatibility;
+globalTestConfig.enforceDefaultLimits = options.enforceDefaultLimits;
+globalTestConfig.blockAllFeatures = options.blockAllFeatures;
 globalTestConfig.logToWebSocket = options.logToWebSocket;
 
 const logger = new Logger();
@@ -84,8 +87,7 @@ stopButtonElem.addEventListener('click', () => {
 if (powerPreference || compatibility || forceFallbackAdapter) {
   setDefaultRequestAdapterOptions({
     ...(powerPreference && { powerPreference }),
-    // MAINTENANCE_TODO: Change this to whatever the option ends up being
-    ...(compatibility && { compatibilityMode: true }),
+    ...(compatibility && { featureLevel: 'compatibility' }),
     ...(forceFallbackAdapter && { forceFallbackAdapter: true }),
   });
 }
@@ -282,7 +284,7 @@ function makeSubtreeHTML(n: TestSubtree, parentLevel: TestQueryLevel): Visualize
       progressElem.style.display = '';
       // only prompt if this is the full CTS and we started from the root.
       if (isFullCTS && n.query.filePathParts.length === 0) {
-        promptBeforeReload = true;
+        enablePromptBeforeReload();
       }
     }
     if (stopRequested) {
@@ -632,17 +634,21 @@ void (async () => {
       return select;
     };
 
-    for (const [optionName, info] of Object.entries(optionsInfos)) {
+    Object.entries(optionsInfos).forEach(([optionName, info], i) => {
+      const id = `option${i}`;
       const input =
         typeof optionValues[optionName] === 'boolean'
           ? createCheckbox(optionName)
           : createSelect(optionName, info);
+      input.attr('id', id);
       $('<tr>')
         .append($('<td>').append(input))
-        .append($('<td>').text(camelCaseToSnakeCase(optionName)))
+        .append(
+          $('<td>').append($('<label>').attr('for', id).text(camelCaseToSnakeCase(optionName)))
+        )
         .append($('<td>').text(info.description))
         .appendTo(optionsElem);
-    }
+    });
   };
   addOptionsToPage(options, kStandaloneOptionsInfos);
 

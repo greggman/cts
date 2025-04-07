@@ -3,10 +3,10 @@
 **/export const description = `
 Testing render pipeline using overridable constants in vertex stage and fragment stage.
 `;import { makeTestGroup } from '../../../../common/framework/test_group.js';
-import { GPUTest } from '../../../gpu_test.js';
+import { AllFeaturesMaxLimitsGPUTest } from '../../../gpu_test.js';
 
 
-class F extends GPUTest {
+class F extends AllFeaturesMaxLimitsGPUTest {
   async ExpectShaderOutputWithConstants(
   isAsync,
   format,
@@ -171,6 +171,7 @@ fn(async (t) => {
   );
 });
 
+const kPrecisionTestFormat = 'rgba32float';
 g.test('precision').
 desc(`Test that the float number precision is preserved for constants`).
 params((u) =>
@@ -191,7 +192,7 @@ combineWithParams([
 )
 ).
 fn(async (t) => {
-  const format = 'rgba32float';
+  const format = kPrecisionTestFormat;
   await t.ExpectShaderOutputWithConstants(
     t.params.isAsync,
     format,

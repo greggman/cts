@@ -6,6 +6,7 @@ Execution tests for the 'textureNumLevels' builtin function
 Returns the number of mip levels of a texture.
 `;import { makeTestGroup } from '../../../../../../common/framework/test_group.js';
 import { getTextureDimensionFromView } from '../../../../../util/texture/base.js';
+import { kShaderStages } from '../../../../validation/decl/util.js';
 
 import { kSampleTypeInfo, WGSLTextureQueryTest } from './texture_utils.js';
 
@@ -66,17 +67,16 @@ combine('texture_type', [
 'texture_cube_array']
 ).
 beginSubcases().
+combine('stage', kShaderStages).
 combine('sampled_type', ['f32', 'i32', 'u32']).
 combine('view_type', ['full', 'partial'])
 // 1d textures can't have mipLevelCount > 0
 .filter((t) => t.texture_type !== 'texture_1d' || t.view_type !== 'partial')
 ).
-beforeAllSubcases((t) => {
-  t.skipIfTextureViewDimensionNotSupported(kTextureTypeToViewDimension[t.params.texture_type]);
-}).
 fn((t) => {
-  const { texture_type, sampled_type, view_type } = t.params;
+  const { stage, texture_type, sampled_type, view_type } = t.params;
   const { format } = kSampleTypeInfo[sampled_type];
+  t.skipIfTextureViewDimensionNotSupported(kTextureTypeToViewDimension[t.params.texture_type]);
 
   const viewDimension = kTextureTypeToViewDimension[texture_type];
   const dimension = getTextureDimensionFromView(viewDimension);
@@ -101,8 +101,8 @@ fn((t) => {
   const code = `
 @group(0) @binding(0) var t: ${texture_type}<${sampled_type}>;
 @group(0) @binding(1) var<storage, read_write> result: u32;
-@compute @workgroup_size(1) fn cs() {
-  result = textureNumLevels(t);
+fn getValue() -> u32 {
+  return textureNumLevels(t);
 }
     `;
 
@@ -110,13 +110,13 @@ fn((t) => {
     view_type,
     mipCount
   );
-  const view = texture.createView({
+  const viewDescription = {
     dimension: viewDimension,
     baseMipLevel,
     mipLevelCount
-  });
+  };
 
-  t.executeAndExpectResult(code, view, expected);
+  t.executeAndExpectResult(stage, code, texture, viewDescription, expected);
 });
 
 g.test('depth').
@@ -140,13 +140,13 @@ combine('texture_type', [
 'texture_depth_cube',
 'texture_depth_cube_array']
 ).
-combine('view_type', ['full', 'partial'])
+combine('view_type', ['full', 'partial']).
+beginSubcases().
+combine('stage', kShaderStages)
 ).
-beforeAllSubcases((t) => {
-  t.skipIfTextureViewDimensionNotSupported(kTextureTypeToViewDimension[t.params.texture_type]);
-}).
 fn((t) => {
-  const { texture_type, view_type } = t.params;
+  const { stage, texture_type, view_type } = t.params;
+  t.skipIfTextureViewDimensionNotSupported(kTextureTypeToViewDimension[t.params.texture_type]);
 
   const viewDimension = kTextureTypeToViewDimension[texture_type];
   const dimension = getTextureDimensionFromView(viewDimension);
@@ -171,8 +171,8 @@ fn((t) => {
   const code = `
 @group(0) @binding(0) var t: ${texture_type};
 @group(0) @binding(1) var<storage, read_write> result: u32;
-@compute @workgroup_size(1) fn cs() {
-  result = textureNumLevels(t);
+fn getValue() -> u32 {
+  return textureNumLevels(t);
 }
     `;
 
@@ -180,12 +180,12 @@ fn((t) => {
     view_type,
     mipCount
   );
-  const view = texture.createView({
+  const viewDescription = {
     dimension: viewDimension,
     baseMipLevel,
     mipLevelCount
-  });
+  };
 
-  t.executeAndExpectResult(code, view, expected);
+  t.executeAndExpectResult(stage, code, texture, viewDescription, expected);
 });
 //# sourceMappingURL=textureNumLevels.spec.js.map

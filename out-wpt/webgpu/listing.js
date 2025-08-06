@@ -63,6 +63,14 @@ export const listing = [
       "api",
       "operation",
       "buffers",
+      "createBindGroup"
+    ]
+  },
+  {
+    "file": [
+      "api",
+      "operation",
+      "buffers",
       "map"
     ]
   },
@@ -565,6 +573,14 @@ export const listing = [
       "api",
       "operation",
       "texture_view",
+      "texture_component_swizzle"
+    ]
+  },
+  {
+    "file": [
+      "api",
+      "operation",
+      "texture_view",
       "write"
     ]
   },
@@ -678,7 +694,34 @@ export const listing = [
       "validation",
       "capability_checks",
       "features",
+      "texture_component_swizzle"
+    ]
+  },
+  {
+    "file": [
+      "api",
+      "validation",
+      "capability_checks",
+      "features",
       "texture_formats"
+    ]
+  },
+  {
+    "file": [
+      "api",
+      "validation",
+      "capability_checks",
+      "features",
+      "texture_formats_tier1"
+    ]
+  },
+  {
+    "file": [
+      "api",
+      "validation",
+      "capability_checks",
+      "features",
+      "texture_formats_tier2"
     ]
   },
   {

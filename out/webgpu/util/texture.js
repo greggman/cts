@@ -632,8 +632,6 @@ desc)
   assert(texelViews.length > 0 && texelViews.every((e) => e.format === texelViews[0].format));
   const viewsFormat = texelViews[0].format;
   const textureFormat = desc.format ?? viewsFormat;
-  const isTextureFormatDifferentThanTexelViewFormat = textureFormat !== viewsFormat;
-  const { width, height, depthOrArrayLayers } = reifyExtent3D(desc.size);
 
   // Create the texture and then initialize each mipmap level separately.
   const texture = t.createTextureTracked({
@@ -642,9 +640,22 @@ desc)
     usage: desc.usage | GPUTextureUsage.COPY_DST,
     mipLevelCount: texelViews.length
   });
+  copyTexelViewsToTexture(t, texture, 'all', texelViews);
+  return texture;
+}
+
+export function copyTexelViewsToTexture(
+t,
+texture,
+aspect,
+texelViews)
+{
+  const viewsFormat = texelViews[0].format;
+  const isTextureFormatDifferentThanTexelViewFormat = texture.format !== viewsFormat;
+  const { width, height, depthOrArrayLayers } = texture;
 
   // Copy the texel view into each mip level layer.
-  const commandEncoder = t.device.createCommandEncoder({ label: 'createTextureFromTexelViews' });
+  const commandEncoder = t.device.createCommandEncoder({ label: 'copyTexelViewToTexture' });
   const resourcesToDestroy = [];
   for (let mipLevel = 0; mipLevel < texelViews.length; mipLevel++) {
     const {
@@ -653,7 +664,7 @@ desc)
       mipSize: [mipWidth, mipHeight, mipDepthOrArray]
     } = getTextureCopyLayout(
       viewsFormat,
-      desc.dimension ?? '2d',
+      texture.dimension ?? '2d',
       [width, height, depthOrArrayLayers],
       {
         mipLevel
@@ -678,11 +689,13 @@ desc)
     });
     stagingBuffer.unmap();
 
-    if (
-    isTextureFormatDifferentThanTexelViewFormat ||
-    texture.sampleCount > 1 ||
-    isDepthOrStencilTextureFormat(textureFormat))
-    {
+    const copyB2TOk =
+    viewsFormat === 'stencil8' && aspect === 'stencil-only' ||
+    !isTextureFormatDifferentThanTexelViewFormat &&
+    texture.sampleCount === 1 &&
+    !isDepthOrStencilTextureFormat(texture.format);
+
+    if (!copyB2TOk) {
       resourcesToDestroy.push(
         ...copyBufferToTextureViaRender(
           t,
@@ -697,7 +710,7 @@ desc)
       // Copy from the staging buffer into the texture.
       commandEncoder.copyBufferToTexture(
         { buffer: stagingBuffer, bytesPerRow, rowsPerImage },
-        { texture, mipLevel },
+        { texture, mipLevel, aspect: aspect ?? 'all' },
         [mipWidth, mipHeight, mipDepthOrArray]
       );
     }
@@ -706,7 +719,5 @@ desc)
 
   // Cleanup temp buffers and textures.
   resourcesToDestroy.forEach((value) => value.destroy());
-
-  return texture;
 }
 //# sourceMappingURL=texture.js.map

@@ -13,12 +13,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v5
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v3
+      - uses: actions/setup-node@v5
         with:
-          node-version: '16.x'
+          node-version: '24.x'
       - run: npm ci
       - name: validating cache
         run: npx grunt run:validate-cache

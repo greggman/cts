@@ -1615,6 +1615,15 @@ const kSamplerFns: Record<GPUCompareFunction, (ref: number, v: number) => boolea
   always: (ref: number, v: number) => true,
 } as const;
 
+const kDefaultValueForDepthTextureComponents: Record<TexelComponent, number> = {
+  R: 0,
+  G: 0,
+  B: 0,
+  A: 1,
+  Depth: 0,
+  Stencil: 0,
+} as const;
+
 /**
  * Applies a comparison function to each component of a texel.
  */
@@ -1627,7 +1636,12 @@ export function applyCompareToTexel(
   const out: PerTexelComponent<number> = {};
   const compareFn = kSamplerFns[compare];
   for (const component of components) {
-    out[component] = compareFn(ref, src[component]!) ? 1 : 0;
+    out[component] =
+      component === 'R' || component === 'Depth'
+        ? compareFn(ref, src[component]!)
+          ? 1
+          : 0
+        : kDefaultValueForDepthTextureComponents[component];
   }
   return out;
 }
@@ -2162,6 +2176,7 @@ function isOutOfBoundsCall<T extends Dimensionality>(
 }
 
 function isValidOutOfBoundsValue(
+  device: GPUDevice,
   softwareTexture: SoftwareTexture,
   gotRGBA: PerTexelComponent<number>,
   maxFractionalDiff: number
@@ -2204,6 +2219,7 @@ function isValidOutOfBoundsValue(
             const rgba = convertPerTexelComponentToResultFormat(texel, mipTexels.format);
             if (
               texelsApproximatelyEqual(
+                device,
                 gotRGBA,
                 softwareTexture.descriptor.format,
                 rgba,
@@ -2231,6 +2247,7 @@ function isValidOutOfBoundsValue(
  * * 0 if a depth texture
  */
 function okBecauseOutOfBounds<T extends Dimensionality>(
+  device: GPUDevice,
   softwareTexture: SoftwareTexture,
   call: TextureCall<T>,
   gotRGBA: PerTexelComponent<number>,
@@ -2240,7 +2257,7 @@ function okBecauseOutOfBounds<T extends Dimensionality>(
     return false;
   }
 
-  return isValidOutOfBoundsValue(softwareTexture, gotRGBA, maxFractionalDiff);
+  return isValidOutOfBoundsValue(device, softwareTexture, gotRGBA, maxFractionalDiff);
 }
 
 const kRGBAComponents = [
@@ -2256,6 +2273,7 @@ const kRComponent = [TexelComponent.R] as const;
  * Compares two Texels
  */
 export function texelsApproximatelyEqual(
+  device: GPUDevice,
   gotRGBA: PerTexelComponent<number>,
   gotFormat: GPUTextureFormat,
   expectRGBA: PerTexelComponent<number>,
@@ -2274,9 +2292,10 @@ export function texelsApproximatelyEqual(
     expectedFormat
   );
 
-  const rgbaComponentsToCheck = isDepthOrStencilTextureFormat(gotFormat)
-    ? kRComponent
-    : kRGBAComponents;
+  const rgbaComponentsToCheck =
+    isDepthOrStencilTextureFormat(gotFormat) && !device.features.has('texel-component-swizzle')
+      ? kRComponent
+      : kRGBAComponents;
 
   for (const component of rgbaComponentsToCheck) {
     const g = gotRGBA[component]!;
@@ -2486,16 +2505,19 @@ export async function checkCallResults<T extends Dimensionality>(
 
     // The spec says depth and stencil have implementation defined values for G, B, and A
     // so if this is `textureGather` and component > 0 then there's nothing to check.
+    // except if texture-component-swizzle is on. Then G = 0, B = 0, A = 1
     if (
       isDepthOrStencilTextureFormat(format) &&
       isBuiltinGather(call.builtin) &&
-      call.component! > 0
+      call.component! > 0 &&
+      !t.device.features.has('texture-component-swizzle')
     ) {
       continue;
     }
 
     if (
       texelsApproximatelyEqual(
+        t.device,
         gotRGBA,
         softwareTexture.descriptor.format,
         expectRGBA,
@@ -2508,7 +2530,7 @@ export async function checkCallResults<T extends Dimensionality>(
 
     if (
       !sampler &&
-      okBecauseOutOfBounds(softwareTexture, call, gotRGBA, callSpecificMaxFractionalDiff)
+      okBecauseOutOfBounds(t.device, softwareTexture, call, gotRGBA, callSpecificMaxFractionalDiff)
     ) {
       continue;
     }
@@ -2517,9 +2539,11 @@ export async function checkCallResults<T extends Dimensionality>(
     const eULP = getULPFromZeroForComponents(expectRGBA, format, call.builtin, call.component);
 
     // from the spec: https://gpuweb.github.io/gpuweb/#reading-depth-stencil
-    // depth and stencil values are D, ?, ?, ?
+    // depth and stencil values are D, ?, ?, ? unless texture-component-swizzle is enabled
+    // in which case it's D, 0, 0, 1
     const rgbaComponentsToCheck =
-      isBuiltinGather(call.builtin) || !isDepthOrStencilTextureFormat(format)
+      (isBuiltinGather(call.builtin) || !isDepthOrStencilTextureFormat(format)) &&
+      t.device.features.has('texture-component-swizzle')
         ? kRGBAComponents
         : kRComponent;
 
@@ -2738,7 +2762,7 @@ we can not do that easily with compressed textures. ###
                 if (useTexelFormatForGPUTexture) {
                   descriptor.format = texels[0].format;
                 }
-                const gpuTexture = createTextureFromTexelViewsLocal(t, texels, descriptor);
+                const gpuTexture = createTextureFromTexelViewsLocal(t, [texels], descriptor);
                 const result = (await checkInfo.runner.run(gpuTexture))[callIdx];
                 gpuTexture.destroy();
                 return result;
@@ -3216,34 +3240,27 @@ export async function readTextureToTexelViews(
   return texelViews;
 }
 
+/**
+ * Creates a texture from an array of TexelViews.
+ * @param t the current test
+ * @param texelViews Array of TexelViews per aspect per mip level. Note that only depth-stencil textures
+ *    have 2 aspects, in which case it's assumed the texelViews are in the order [depth, stencil]
+ * @param desc description for the texture to be created
+ * @returns created texture
+ */
 function createTextureFromTexelViewsLocal(
   t: GPUTest,
-  texelViews: TexelView[],
+  texelViews: TexelView[][],
   desc: GPUTextureDescriptor
 ): GPUTexture {
   const modifiedDescriptor = { ...desc };
   // If it's a depth or stencil texture we need to render to it to fill it with data.
   if (isDepthOrStencilTextureFormat(desc.format) || desc.sampleCount! > 1) {
-    modifiedDescriptor.usage =
-      desc.usage | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC;
+    modifiedDescriptor.usage = desc.usage | GPUTextureUsage.RENDER_ATTACHMENT;
   }
-  let texture = createTextureFromTexelViews(t, texelViews, modifiedDescriptor);
-  if ((texture.usage & ~GPUTextureUsage.COPY_DST) !== (desc.usage & ~GPUTextureUsage.COPY_DST)) {
-    const copy = t.createTextureTracked({
-      ...desc,
-      usage: desc.usage | GPUTextureUsage.COPY_DST,
-    });
-    const encoder = t.device.createCommandEncoder();
-    for (let mipLevel = 0; mipLevel < texture.mipLevelCount; ++mipLevel) {
-      encoder.copyTextureToTexture(
-        { texture, mipLevel },
-        { texture: copy, mipLevel },
-        physicalMipSizeFromTexture(texture, mipLevel)
-      );
-    }
-    t.device.queue.submit([encoder.finish()]);
-    texture.destroy();
-    texture = copy;
+  const texture = createTextureFromTexelViews(t, texelViews[0], modifiedDescriptor);
+  if (texelViews.length > 1) {
+    copyTexelViewsToTexture(t, texture, 'stencil-only', texelViews[1]);
   }
   return texture;
 }
@@ -3289,25 +3306,25 @@ export async function createTextureWithRandomDataAndGetTexelsForEachAspect(
       ...descriptor,
       format: 'depth32float' as GPUTextureFormat,
     };
-    const tempTexels = createRandomTexelViewMipmap(d32Descriptor, options);
-    const texture = createTextureFromTexelViewsLocal(t, tempTexels, descriptor);
+    const stencilTexels = isStencilTextureFormat(descriptor.format)
+      ? [createRandomTexelViewMipmap({ ...descriptor, format: 'stencil8' })]
+      : [];
+    const texture = createTextureFromTexelViewsLocal(
+      t,
+      [createRandomTexelViewMipmap(d32Descriptor, options), ...stencilTexels],
+      descriptor
+    );
     const texels = await readTextureToTexelViews(
       t,
       texture,
       descriptor,
       getTexelViewFormatForTextureFormat(texture.format)
     );
-    const texelsPerAspect = [texels];
-    if (isStencilTextureFormat(descriptor.format)) {
-      // fill in the stencil with random values.
-      const texels = createRandomTexelViewMipmap({ ...descriptor, format: 'stencil8' });
-      texelsPerAspect.push(texels);
-      copyTexelViewsToTexture(t, texture, 'stencil-only', texels);
-    }
+    const texelsPerAspect = [texels, ...stencilTexels];
     return { texture, texels: texelsPerAspect };
   } else {
     const texels = createRandomTexelViewMipmap(descriptor, options);
-    const texture = createTextureFromTexelViewsLocal(t, texels, descriptor);
+    const texture = createTextureFromTexelViewsLocal(t, [texels], descriptor);
     return { texture, texels: [texels] };
   }
 }

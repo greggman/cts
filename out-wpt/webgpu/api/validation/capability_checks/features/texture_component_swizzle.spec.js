@@ -8,17 +8,67 @@ Test that:
 * swizzling is not allowed on textures with usage STORAGE_BINDING nor RENDER_ATTACHMENT
   except the identity swizzle.
 `;import { makeTestGroup } from '../../../../../common/framework/test_group.js';
-import { GPUConst } from '../../../../constants.js';
 import { UniqueFeaturesOrLimitsGPUTest } from '../../../../gpu_test.js';
 
-import {
-  isIdentitySwizzle,
-  kSwizzleTests,
-  swizzlesAreTheSame,
-  swizzleSpecToGPUTextureComponentSwizzle } from
-'./texture_component_swizzle_utils.js';
+import { isIdentitySwizzle, kSwizzleTests } from './texture_component_swizzle_utils.js';
 
 export const g = makeTestGroup(UniqueFeaturesOrLimitsGPUTest);
+
+g.test('invalid_swizzle').
+desc(
+  `
+  Test that setting an invalid swizzle value on a texture view throws an exception.
+  `
+).
+params((u) =>
+u.beginSubcases().combine('invalidSwizzle', [
+'rgbA', // swizzles are case-sensitive
+'RGBA', // swizzles are case-sensitive
+'rgb', // must have 4 components
+'rgba01',
+'ɲgba', // r with 0x200 added to each code point to make sure values are not truncated.
+'ɲɧɢɡ', // rgba with 0x200 added to each code point to make sure values are not truncated.
+'𝐫𝐠𝐛𝐚', // various unicode values that normalize to rgba
+'𝑟𝑔𝑏𝑎',
+'𝗋𝗀𝖻𝖺',
+'𝓇ℊ𝒷𝒶',
+'ⓡⓖⓑⓐ',
+'ｒｇｂａ',
+'ʳᵍᵇᵃ',
+'000',
+'00000',
+'111',
+'11111',
+0,
+1,
+1111, // passes because toString is '1111'
+1234,
+1111.1,
+0x72676261, // big endian rgba
+0x61626772, // little endian rgba
+0x30303030, // 0000
+0x31313131, // 1111
+true,
+false,
+null]
+)
+).
+beforeAllSubcases((t) => {
+  t.selectDeviceOrSkipTestCase('texture-component-swizzle');
+}).
+fn((t) => {
+  const { invalidSwizzle } = t.params;
+  const texture = t.createTextureTracked({
+    format: 'rgba8unorm',
+    size: [1],
+    usage: GPUTextureUsage.COPY_DST | GPUTextureUsage.TEXTURE_BINDING
+  });
+
+  const failure = typeof invalidSwizzle !== 'number' || invalidSwizzle !== 1111;
+  t.shouldThrow(failure ? 'TypeError' : false, () => {
+    texture.createView({ swizzle: invalidSwizzle });
+  });
+});
 
 g.test('only_identity_swizzle').
 desc(
@@ -26,10 +76,9 @@ desc(
   Test that if texture-component-swizzle is not enabled, having a non-default swizzle property generates a validation error.
   `
 ).
-params((u) => u.beginSubcases().combine('swizzleSpec', kSwizzleTests)).
+params((u) => u.beginSubcases().combine('swizzle', kSwizzleTests)).
 fn((t) => {
-  const { swizzleSpec } = t.params;
-  const swizzle = swizzleSpecToGPUTextureComponentSwizzle(swizzleSpec);
+  const { swizzle } = t.params;
   const texture = t.createTextureTracked({
     format: 'rgba8unorm',
     size: [1],
@@ -41,45 +90,163 @@ fn((t) => {
   }, shouldError);
 });
 
-g.test('no_render_nor_storage').
+g.test('no_render_no_resolve_no_storage').
 desc(
   `
-  Test that setting the swizzle on the texture with RENDER_ATTACHMENT or STORAGE_BINDING usage works
-  if the swizzle is the identity but generates a validation error otherwise.
+  Test that setting a non-identity swizzle gets an error if used as a render attachment,
+  a resolve target, or a storage binding.
   `
 ).
 params((u) =>
 u.
-combine('usage', [
-GPUConst.TextureUsage.COPY_SRC,
-GPUConst.TextureUsage.COPY_DST,
-GPUConst.TextureUsage.TEXTURE_BINDING,
-GPUConst.TextureUsage.RENDER_ATTACHMENT,
-GPUConst.TextureUsage.STORAGE_BINDING]
+combine('useCase', [
+'texture-binding',
+'color-attachment',
+'depth-attachment',
+'stencil-attachment',
+'resolve-target',
+'storage-binding']
 ).
 beginSubcases().
-combine('swizzleSpec', kSwizzleTests)
+combine('swizzle', kSwizzleTests)
 ).
 beforeAllSubcases((t) => {
-  // MAINTENANCE_TODO: Remove this cast once texture-component-swizzle is added to @webgpu/types
   t.selectDeviceOrSkipTestCase('texture-component-swizzle');
 }).
 fn((t) => {
-  const { swizzleSpec, usage } = t.params;
-  const swizzle = swizzleSpecToGPUTextureComponentSwizzle(swizzleSpec);
+  const { swizzle, useCase } = t.params;
   const texture = t.createTextureTracked({
-    format: 'rgba8unorm',
+    format:
+    useCase === 'depth-attachment' ?
+    'depth16unorm' :
+    useCase === 'stencil-attachment' ?
+    'stencil8' :
+    'rgba8unorm',
     size: [1],
-    usage
+    usage:
+    GPUTextureUsage.COPY_SRC |
+    GPUTextureUsage.COPY_DST |
+    GPUTextureUsage.TEXTURE_BINDING |
+    GPUTextureUsage.RENDER_ATTACHMENT | (
+    useCase === 'storage-binding' ? GPUTextureUsage.STORAGE_BINDING : 0)
   });
-  const badUsage =
-  (usage & (
-  GPUConst.TextureUsage.RENDER_ATTACHMENT | GPUConst.TextureUsage.STORAGE_BINDING)) !==
-  0;
-  const shouldError = badUsage && !isIdentitySwizzle(swizzle);
-  t.expectValidationError(() => {
-    texture.createView({ swizzle });
-  }, shouldError);
+  const view = texture.createView({ swizzle });
+  const shouldError = useCase !== 'texture-binding' && !isIdentitySwizzle(swizzle);
+  switch (useCase) {
+    case 'texture-binding':{
+        const bindGroupLayout = t.device.createBindGroupLayout({
+          entries: [
+          {
+            binding: 0,
+            visibility: GPUShaderStage.FRAGMENT,
+            texture: {}
+          }]
+
+        });
+        t.expectValidationError(() => {
+          t.device.createBindGroup({
+            layout: bindGroupLayout,
+            entries: [{ binding: 0, resource: view }]
+          });
+        }, shouldError);
+        break;
+      }
+    case 'color-attachment':{
+        t.expectValidationError(() => {
+          const encoder = t.device.createCommandEncoder();
+          const pass = encoder.beginRenderPass({
+            colorAttachments: [
+            {
+              view,
+              loadOp: 'clear',
+              storeOp: 'store'
+            }]
+
+          });
+          pass.end();
+          encoder.finish();
+        }, shouldError);
+        break;
+      }
+    case 'depth-attachment':{
+        t.expectValidationError(() => {
+          const encoder = t.device.createCommandEncoder();
+          const pass = encoder.beginRenderPass({
+            colorAttachments: [],
+            depthStencilAttachment: {
+              view,
+              depthClearValue: 1,
+              depthLoadOp: 'clear',
+              depthStoreOp: 'store'
+            }
+          });
+          pass.end();
+          encoder.finish();
+        }, shouldError);
+        break;
+      }
+    case 'stencil-attachment':{
+        t.expectValidationError(() => {
+          const encoder = t.device.createCommandEncoder();
+          const pass = encoder.beginRenderPass({
+            colorAttachments: [],
+            depthStencilAttachment: {
+              view,
+              stencilClearValue: 0,
+              stencilLoadOp: 'clear',
+              stencilStoreOp: 'store'
+            }
+          });
+          pass.end();
+          encoder.finish();
+        }, shouldError);
+        break;
+      }
+    case 'resolve-target':{
+        t.expectValidationError(() => {
+          const encoder = t.device.createCommandEncoder();
+          const pass = encoder.beginRenderPass({
+            colorAttachments: [
+            {
+              view: t.createTextureTracked({
+                format: 'rgba8unorm',
+                size: [1],
+                usage: GPUTextureUsage.RENDER_ATTACHMENT,
+                sampleCount: 4
+              }),
+              resolveTarget: view,
+              loadOp: 'clear',
+              storeOp: 'store'
+            }]
+
+          });
+          pass.end();
+          encoder.finish();
+        }, shouldError);
+        break;
+      }
+    case 'storage-binding':{
+        const bindGroupLayout = t.device.createBindGroupLayout({
+          entries: [
+          {
+            binding: 0,
+            visibility: GPUShaderStage.COMPUTE,
+            storageTexture: {
+              access: 'read-only',
+              format: 'rgba8unorm'
+            }
+          }]
+
+        });
+        t.expectValidationError(() => {
+          t.device.createBindGroup({
+            layout: bindGroupLayout,
+            entries: [{ binding: 0, resource: view }]
+          });
+        }, shouldError);
+        break;
+      }
+  }
 });
 
 g.test('compatibility_mode').
@@ -89,20 +256,17 @@ desc(
   `
 ).
 beforeAllSubcases((t) => {
-  // MAINTENANCE_TODO: Remove this cast once texture-component-swizzle is added to @webgpu/types
   t.selectDeviceOrSkipTestCase('texture-component-swizzle');
 }).
 params((u) =>
 u.
 beginSubcases().
-combine('swizzleSpec', kSwizzleTests).
-combine('otherSwizzleSpec', kSwizzleTests).
+combine('swizzle', kSwizzleTests).
+combine('otherSwizzle', kSwizzleTests).
 combine('pipelineType', ['render', 'compute'])
 ).
 fn((t) => {
-  const { swizzleSpec, otherSwizzleSpec, pipelineType } = t.params;
-  const swizzle = swizzleSpecToGPUTextureComponentSwizzle(swizzleSpec);
-  const otherSwizzle = swizzleSpecToGPUTextureComponentSwizzle(otherSwizzleSpec);
+  const { swizzle, otherSwizzle, pipelineType } = t.params;
 
   const module = t.device.createShaderModule({
     code: `
@@ -192,7 +356,7 @@ fn((t) => {
       }
   }
 
-  const shouldError = t.isCompatibility && !swizzlesAreTheSame(swizzle, otherSwizzle);
+  const shouldError = t.isCompatibility && swizzle !== otherSwizzle;
 
   t.expectValidationError(() => {
     encoder.finish();

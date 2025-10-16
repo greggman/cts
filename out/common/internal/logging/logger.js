@@ -10,6 +10,7 @@ export class Logger {
 
   results = new Map();
 
+
   constructor({ overrideDebugMode } = {}) {
     this.overriddenDebugMode = overrideDebugMode;
   }
@@ -23,8 +24,20 @@ export class Logger {
 
   }
 
-  asJSON(space) {
-    return JSON.stringify({ version, results: Array.from(this.results) }, undefined, space);
+  asJSON(space, predFunc) {
+    return JSON.stringify(
+      {
+        version,
+        defaultDevice: this.defaultDeviceDescription,
+        results: Array.from(
+          new Map(
+            [...this.results].filter(([key, value]) => predFunc ? predFunc(key, value) : true)
+          )
+        )
+      },
+      undefined,
+      space
+    );
   }
 }
 //# sourceMappingURL=logger.js.map

@@ -185,7 +185,14 @@ function generateOp(op: string): string {
   }
 }
 
-function generateConditionalStatement(statement: string, condition: string, op: string): string {
+const kStatementKinds = ['if', 'for', 'while', 'switch', 'break-if'] as const;
+type kStatementType = (typeof kStatementKinds)[number];
+
+function generateConditionalStatement(
+  statement: kStatementType,
+  condition: string,
+  op: string
+): string {
   const code = ``;
   switch (statement) {
     case 'if': {
@@ -215,8 +222,19 @@ function generateConditionalStatement(statement: string, condition: string, op: 
       }
       `;
     }
-    default: {
-      unreachable(`Unhandled statement`);
+    case 'break-if': {
+      // The initial 'if' prevents the loop from being infinite.  Its condition
+      // is uniform, to ensure the first iteration of the the body executes
+      // uniformly. The uniformity of the second iteration depends entirely on
+      // the uniformity of the break-if condition.
+      return `loop {
+        if ${generateCondition('uniform_storage_ro')} { break; }
+        ${generateOp(op)}
+        continuing {
+          break if ${generateCondition(condition)};
+        }
+      }
+      `;
     }
   }
 
@@ -227,7 +245,7 @@ g.test('basics')
   .desc(`Test collective operations in simple uniform or non-uniform control flow.`)
   .params(u =>
     u
-      .combine('statement', ['if', 'for', 'while', 'switch'] as const)
+      .combine('statement', kStatementKinds)
       .beginSubcases()
       .combineWithParams(kConditions)
       .combineWithParams(kCollectiveOps)
@@ -315,7 +333,7 @@ g.test('basics,subgroups')
   .desc(`Test subgroup operations in simple uniform or non-uniform control flow.`)
   .params(u =>
     u
-      .combine('statement', ['if', 'for', 'while', 'switch'] as const)
+      .combine('statement', kStatementKinds)
       .beginSubcases()
       .combineWithParams(kConditions)
       .combine('op', kSubgroupOps)
@@ -394,6 +412,10 @@ const kFragmentBuiltinValues = [
     builtin: `subgroup_size`,
     type: `u32`,
   },
+  {
+    builtin: `primitive_id`,
+    type: `u32`,
+  },
 ];
 
 g.test('fragment_builtin_values')
@@ -428,7 +450,13 @@ g.test('fragment_builtin_values')
         unreachable(`Unhandled type`);
       }
     }
-    const enable = t.params.builtin.includes('subgroup') ? 'enable subgroups;' : '';
+    let enable = '';
+    if (t.params.builtin.includes('subgroup')) {
+      enable = 'enable subgroups;\n';
+    } else if (t.params.builtin === 'primitive_id') {
+      enable = 'enable chromium_experimental_primitive_id;\n';
+    }
+
     const code = `
 ${enable}
 @group(0) @binding(0) var s : sampler;

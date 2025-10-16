@@ -38,7 +38,8 @@ import {
   isStencilTextureFormat,
   textureViewDimensionAndFormatCompatibleForDevice,
   textureDimensionAndFormatCompatibleForDevice,
-  isTextureFormatUsableWithStorageAccessMode } from
+  isTextureFormatUsableWithStorageAccessMode,
+  isTextureFormatUsableWithCopyExternalImageToTexture } from
 './format_info.js';
 import { checkElementsEqual, checkElementsBetween } from './util/check_contents.js';
 import { CommandBufferMaker } from './util/command_buffer_maker.js';
@@ -644,6 +645,13 @@ export class GPUTestBase extends Fixture {
     );
   }
 
+  skipIfTextureFormatPossiblyNotUsableWithCopyExternalImageToTexture(format) {
+    this.skipIf(
+      !isTextureFormatUsableWithCopyExternalImageToTexture(this.device, format),
+      `can not use copyExternalImageToTexture with ${format}`
+    );
+  }
+
   /** Skips this test case if the `langFeature` is *not* supported. */
   skipIfLanguageFeatureNotSupported(langFeature) {
     if (!this.hasLanguageFeature(langFeature)) {
@@ -1208,6 +1216,23 @@ export class GPUTestBase extends Fixture {
           this.rec.debug(niceStack);
         }
       });
+    }
+  }
+
+  /**
+   * Expect a validation error or exception inside the callback.
+   *
+   * Tests should always do just one WebGPU call in the callback, to make sure that's what's tested.
+   */
+  expectValidationErrorOrException(
+  fn,
+  shouldError = true,
+  shouldThrow = true)
+  {
+    if (shouldThrow) {
+      this.shouldThrow(shouldError, fn);
+    } else {
+      this.expectValidationError(fn, shouldError);
     }
   }
 

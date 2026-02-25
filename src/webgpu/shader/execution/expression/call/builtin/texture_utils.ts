@@ -2702,7 +2702,7 @@ export async function checkCallResults<T extends Dimensionality>(
         errs.push(`gradient based mip level: ${mipLevel}`);
       }
       errs.push(`\
-       got: ${fix5v(rgbaToArray(gotRGBA))}
+       gotdd: ${fix5v(rgbaToArray(gotRGBA))}
   expected: ${fix5v(rgbaToArray(expectRGBA))}
   max diff: ${callSpecificMaxFractionalDiff}
  abs diffs: ${fix5v(diffs.map(({ absDiff }) => absDiff))}
